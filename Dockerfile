@@ -21,30 +21,41 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                 RANGE SCALP FAST-IN FAST-OUT                    |
-//|              Mean Reversion / Range Scalping                    |
+//|               TICK SCALP HYPER AGGRESSIVE BOT                   |
+//|          Tick-Based Mean Reversion Micro Scalper                |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property strict
-#property version "4.0"
+#property version "8.0"
 
-input string   SymbolToTrade       = "EURUSD.vx";
-input double   FixedLot            = 0.01;
+input string SymbolToTrade = "EURUSD.vx";
 
-input int      RangeBars           = 12;
-input double   EntryBufferPoints   = 2;
+input double FixedLot = 0.01;
 
-input bool     CloseOnAnyProfit    = true;
-input bool     AllowMultipleTrades = true;
+input int TickLookback = 25;
 
-input int      MaxPositions        = 5;
+input double TickMovePoints = 3;
 
-input int      CooldownMs          = 500;
+input double ProfitCloseUSD = 0.03;
 
-input int      MagicNumber         = 888444;
+input double EmergencyLossUSD = -4.0;
 
-input bool     DebugPrint          = true;
+input bool AllowMultiplePositions = true;
+
+input int MaxPositions = 10;
+
+input int CooldownMilliseconds = 300;
+
+input int MaxSpreadPoints = 25;
+
+input bool UseTrendFilter = false;
+
+input int EMA_Period = 20;
+
+input bool DebugPrint = false;
+
+input int MagicNumber = 989898;
 
 CTrade trade;
 
@@ -52,19 +63,25 @@ double point;
 
 ulong lastTradeMs = 0;
 
+// TICK STORAGE
+double tickPrices[200];
+int tickCount = 0;
+
 //+------------------------------------------------------------------+
 int CountPositions()
 {
    int total = 0;
 
-   for(int i=PositionsTotal()-1; i>=0; i--)
+   for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
 
       if(PositionSelectByTicket(ticket))
       {
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
-            PositionGetString(POSITION_SYMBOL) == SymbolToTrade)
+         if(PositionGetInteger(POSITION_MAGIC)
+            == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL)
+            == SymbolToTrade)
          {
             total++;
          }
@@ -75,34 +92,146 @@ int CountPositions()
 }
 
 //+------------------------------------------------------------------+
-double GetRangeLow()
+void ManagePositions()
+{
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(PositionSelectByTicket(ticket))
+      {
+         if(PositionGetInteger(POSITION_MAGIC)
+            != MagicNumber)
+            continue;
+
+         double profit =
+            PositionGetDouble(POSITION_PROFIT);
+
+         // CLOSE ANY PROFIT FAST
+         if(profit >= ProfitCloseUSD)
+         {
+            trade.PositionClose(ticket);
+
+            if(DebugPrint)
+               Print("💰 QUICK EXIT: ", profit);
+         }
+
+         // EMERGENCY EXIT
+         if(profit <= EmergencyLossUSD)
+         {
+            trade.PositionClose(ticket);
+
+            if(DebugPrint)
+               Print("🛑 LOSS EXIT: ", profit);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+bool SpreadOK()
+{
+   double spread =
+      (SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK)
+      -
+      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID))
+      / point;
+
+   return spread <= MaxSpreadPoints;
+}
+
+//+------------------------------------------------------------------+
+bool BuyTrendOK()
+{
+   if(!UseTrendFilter)
+      return true;
+
+   double ema =
+      iMA(
+         SymbolToTrade,
+         PERIOD_M1,
+         EMA_Period,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+   double price =
+      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+
+   return price > ema;
+}
+
+//+------------------------------------------------------------------+
+bool SellTrendOK()
+{
+   if(!UseTrendFilter)
+      return true;
+
+   double ema =
+      iMA(
+         SymbolToTrade,
+         PERIOD_M1,
+         EMA_Period,
+         0,
+         MODE_EMA,
+         PRICE_CLOSE
+      );
+
+   double price =
+      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+
+   return price < ema;
+}
+
+//+------------------------------------------------------------------+
+void StoreTick(double price)
+{
+   if(tickCount < 200)
+   {
+      tickPrices[tickCount] = price;
+      tickCount++;
+   }
+   else
+   {
+      for(int i=0; i<199; i++)
+      {
+         tickPrices[i] = tickPrices[i+1];
+      }
+
+      tickPrices[199] = price;
+   }
+}
+
+//+------------------------------------------------------------------+
+double GetLowestTick()
 {
    double low = DBL_MAX;
 
-   for(int i=1; i<=RangeBars; i++)
-   {
-      double l =
-         iLow(SymbolToTrade, PERIOD_M1, i);
+   int start =
+      MathMax(0, tickCount - TickLookback);
 
-      if(l < low)
-         low = l;
+   for(int i=start; i<tickCount; i++)
+   {
+      if(tickPrices[i] < low)
+         low = tickPrices[i];
    }
 
    return low;
 }
 
 //+------------------------------------------------------------------+
-double GetRangeHigh()
+double GetHighestTick()
 {
    double high = -DBL_MAX;
 
-   for(int i=1; i<=RangeBars; i++)
-   {
-      double h =
-         iHigh(SymbolToTrade, PERIOD_M1, i);
+   int start =
+      MathMax(0, tickCount - TickLookback);
 
-      if(h > high)
-         high = h;
+   for(int i=start; i<tickCount; i++)
+   {
+      if(tickPrices[i] > high)
+         high = tickPrices[i];
    }
 
    return high;
@@ -121,14 +250,15 @@ void OpenBuy()
          ask,
          0,
          0,
-         "RANGE BUY"
+         "TICK BUY"
       );
 
    if(ok)
    {
       lastTradeMs = GetTickCount64();
 
-      Print("🔥 RANGE BUY OPENED");
+      if(DebugPrint)
+         Print("🔥 BUY OPENED");
    }
    else
    {
@@ -152,14 +282,15 @@ void OpenSell()
          bid,
          0,
          0,
-         "RANGE SELL"
+         "TICK SELL"
       );
 
    if(ok)
    {
       lastTradeMs = GetTickCount64();
 
-      Print("🔥 RANGE SELL OPENED");
+      if(DebugPrint)
+         Print("🔥 SELL OPENED");
    }
    else
    {
@@ -167,33 +298,6 @@ void OpenSell()
          "❌ SELL FAILED: ",
          trade.ResultRetcodeDescription()
       );
-   }
-}
-
-//+------------------------------------------------------------------+
-void ManagePositions()
-{
-   for(int i=PositionsTotal()-1; i>=0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-
-      if(PositionSelectByTicket(ticket))
-      {
-         if(PositionGetInteger(POSITION_MAGIC)
-            != MagicNumber)
-            continue;
-
-         double profit =
-            PositionGetDouble(POSITION_PROFIT);
-
-         // CLOSE IMMEDIATELY ON ANY PROFIT
-         if(CloseOnAnyProfit && profit > 0)
-         {
-            trade.PositionClose(ticket);
-
-            Print("💰 QUICK PROFIT: ", profit);
-         }
-      }
    }
 }
 
@@ -213,7 +317,7 @@ int OnInit()
       );
 
    Print("================================");
-   Print("⚡ RANGE SCALPER STARTED");
+   Print("⚡ TICK SCALPER STARTED");
    Print("================================");
 
    return(INIT_SUCCEEDED);
@@ -224,7 +328,10 @@ void OnTick()
 {
    ManagePositions();
 
-   if(!AllowMultipleTrades)
+   if(!SpreadOK())
+      return;
+
+   if(!AllowMultiplePositions)
    {
       if(CountPositions() > 0)
          return;
@@ -236,16 +343,10 @@ void OnTick()
    ulong nowMs = GetTickCount64();
 
    if(nowMs - lastTradeMs <
-      (ulong)CooldownMs)
+      (ulong)CooldownMilliseconds)
    {
       return;
    }
-
-   double rangeLow =
-      GetRangeLow();
-
-   double rangeHigh =
-      GetRangeHigh();
 
    double bid =
       SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
@@ -253,34 +354,51 @@ void OnTick()
    double ask =
       SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
 
-   // BUY NEAR RANGE BOTTOM
-   bool buySignal =
-      bid <=
-      (rangeLow + EntryBufferPoints * point);
+   double mid =
+      (bid + ask) / 2.0;
 
-   // SELL NEAR RANGE TOP
+   // STORE LIVE TICK
+   StoreTick(mid);
+
+   if(tickCount < TickLookback)
+      return;
+
+   double lowestTick =
+      GetLowestTick();
+
+   double highestTick =
+      GetHighestTick();
+
+   // AGGRESSIVE MICRO REVERSAL
+
+   bool buySignal =
+      bid <
+      (lowestTick -
+      TickMovePoints * point);
+
    bool sellSignal =
-      ask >=
-      (rangeHigh - EntryBufferPoints * point);
+      ask >
+      (highestTick +
+      TickMovePoints * point);
 
    if(DebugPrint)
    {
       Print(
-         "RANGE LOW=", rangeLow,
-         " RANGE HIGH=", rangeHigh,
-         " BID=", bid,
-         " ASK=", ask
+         "BID=", bid,
+         " LOWEST=", lowestTick,
+         " ASK=", ask,
+         " HIGHEST=", highestTick
       );
    }
 
    // BUY
-   if(buySignal)
+   if(buySignal && BuyTrendOK())
    {
       OpenBuy();
    }
 
    // SELL
-   if(sellSignal)
+   if(sellSignal && SellTrendOK())
    {
       OpenSell();
    }
