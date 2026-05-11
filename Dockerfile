@@ -21,74 +21,130 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|               TICK SCALP HYPER AGGRESSIVE BOT                   |
-//|          Tick-Based Mean Reversion Micro Scalper                |
+//|           EXPONENTIAL SWEEP SCALPER - M1                          |
+//|   Opens dozens of trades, closes at 1-2 pips profit, compounds   |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property strict
-#property version "8.0"
+#property version "4.0"
 
-input string SymbolToTrade = "EURUSD.vx";
+// --- INPUTS ---
+input string   SymbolToTrade       = "EURUSD.vx";
+input double   BaseLot             = 0.01;          // Starting lot
+input double   RiskPercent         = 1.0;           // % of equity per trade (dynamic lot)
+input bool     UseExponentialLot   = true;          // Lot = base * (equity/initial)^2
 
-input double FixedLot = 0.01;
+input int      LookbackBars        = 5;             // Smaller = more sweeps
+input double   SweepPoints         = 0;             // 0 = break of low/high triggers
+input bool     RequireCloseAbove   = false;         // False breakout filter (optional)
 
-input int TickLookback = 25;
+input int      StopLossPoints      = 150;           // Wider SL (15 pips)
+input int      TakeProfitPoints    = 15;            // TINY TP (1.5 pips) → FAST CLOSE
+input double   MinProfitToClose    = 0.20;          // Close only if profit > 0.20$
+input int      CloseAfterSeconds   = 20;            // Force close after 20 seconds
 
-input double TickMovePoints = 3;
+input bool     AllowMultipleTrades = true;
+input int      MaxPositions        = 15;            // More positions = more compounding
 
-input double ProfitCloseUSD = 0.03;
-
-input double EmergencyLossUSD = -4.0;
-
-input bool AllowMultiplePositions = true;
-
-input int MaxPositions = 10;
-
-input int CooldownMilliseconds = 300;
-
-input int MaxSpreadPoints = 25;
-
-input bool UseTrendFilter = false;
-
-input int EMA_Period = 20;
-
-input bool DebugPrint = false;
-
-input int MagicNumber = 989898;
+input int      MagicNumber         = 777999;
+input bool     DebugPrint          = false;
 
 CTrade trade;
-
 double point;
-
-ulong lastTradeMs = 0;
-
-// TICK STORAGE
-double tickPrices[200];
-int tickCount = 0;
+double initialEquity;
+datetime lastBarTime = 0;
 
 //+------------------------------------------------------------------+
 int CountPositions()
 {
    int total = 0;
-
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
-
       if(PositionSelectByTicket(ticket))
-      {
-         if(PositionGetInteger(POSITION_MAGIC)
-            == MagicNumber &&
-            PositionGetString(POSITION_SYMBOL)
-            == SymbolToTrade)
-         {
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == SymbolToTrade)
             total++;
-         }
-      }
    }
-
    return total;
+}
+
+//+------------------------------------------------------------------+
+double GetLowestLow(int shiftFrom = 2)
+{
+   double low = DBL_MAX;
+   for(int i = shiftFrom; i <= LookbackBars; i++)
+   {
+      double l = iLow(SymbolToTrade, PERIOD_M1, i);
+      if(l < low) low = l;
+   }
+   return low;
+}
+
+//+------------------------------------------------------------------+
+double GetHighestHigh(int shiftFrom = 2)
+{
+   double high = -DBL_MAX;
+   for(int i = shiftFrom; i <= LookbackBars; i++)
+   {
+      double h = iHigh(SymbolToTrade, PERIOD_M1, i);
+      if(h > high) high = h;
+   }
+   return high;
+}
+
+//+------------------------------------------------------------------+
+double CalculateDynamicLot()
+{
+   double lot = BaseLot;
+   if(UseExponentialLot)
+   {
+      double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double ratio = equity / initialEquity;
+      lot = BaseLot * ratio * ratio;       // Quadratic growth
+      lot = MathMin(lot, 1.0);             // Cap at 1.0 (adjust as needed)
+   }
+   else if(RiskPercent > 0)
+   {
+      double riskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * RiskPercent / 100.0;
+      double tickValue = SymbolInfoDouble(SymbolToTrade, SYMBOL_TRADE_TICK_VALUE);
+      double slPoints = StopLossPoints;
+      lot = riskMoney / (slPoints * tickValue);
+   }
+   lot = MathMax(lot, SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MIN));
+   lot = MathMin(lot, SymbolInfoDouble(SymbolToTrade, SYMBOL_VOLUME_MAX));
+   return NormalizeDouble(lot, 2);
+}
+
+//+------------------------------------------------------------------+
+void OpenBuy()
+{
+   double lot = CalculateDynamicLot();
+   double ask = SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
+   double sl = ask - StopLossPoints * point;
+   double tp = ask + TakeProfitPoints * point;
+
+   if(trade.Buy(lot, SymbolToTrade, ask, sl, tp, "EXP SWEEP BUY"))
+   {
+      if(DebugPrint) Print("🔥 BUY opened | Lot=", lot, " TP=", TakeProfitPoints*point*10000, "pips");
+   }
+   else Print("❌ BUY failed: ", trade.ResultRetcodeDescription());
+}
+
+//+------------------------------------------------------------------+
+void OpenSell()
+{
+   double lot = CalculateDynamicLot();
+   double bid = SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
+   double sl = bid + StopLossPoints * point;
+   double tp = bid - TakeProfitPoints * point;
+
+   if(trade.Sell(lot, SymbolToTrade, bid, sl, tp, "EXP SWEEP SELL"))
+   {
+      if(DebugPrint) Print("🔥 SELL opened | Lot=", lot);
+   }
+   else Print("❌ SELL failed: ", trade.ResultRetcodeDescription());
 }
 
 //+------------------------------------------------------------------+
@@ -97,207 +153,36 @@ void ManagePositions()
    for(int i = PositionsTotal()-1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
 
-      if(PositionSelectByTicket(ticket))
+      double profit = PositionGetDouble(POSITION_PROFIT);
+      datetime openTime = (datetime)PositionGetInteger(POSITION_TIME);
+      int direction = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentPrice = (direction == 1) ? SymbolInfoDouble(SymbolToTrade, SYMBOL_BID) 
+                                             : SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
+      double pointsGain = (currentPrice - openPrice) / point * direction;
+
+      // --- Close conditions ---
+      bool closeProfit = (profit > MinProfitToClose);
+      bool closeTimeout = (TimeCurrent() - openTime >= CloseAfterSeconds);
+      bool closeTrailing = (pointsGain > 5 && pointsGain < TakeProfitPoints); // partial take
+
+      if(closeProfit || closeTimeout)
       {
-         if(PositionGetInteger(POSITION_MAGIC)
-            != MagicNumber)
-            continue;
-
-         double profit =
-            PositionGetDouble(POSITION_PROFIT);
-
-         // CLOSE ANY PROFIT FAST
-         if(profit >= ProfitCloseUSD)
+         if(trade.PositionClose(ticket))
+            if(DebugPrint) Print("💰 CLOSED | profit=", profit, " | time=", (TimeCurrent()-openTime), "sec");
+      }
+      // Optional: move SL to breakeven after 3 points profit
+      else if(pointsGain > 3)
+      {
+         double newSL = (direction == 1) ? openPrice : openPrice;
+         if(PositionGetDouble(POSITION_SL) != newSL)
          {
-            trade.PositionClose(ticket);
-
-            if(DebugPrint)
-               Print("💰 QUICK EXIT: ", profit);
-         }
-
-         // EMERGENCY EXIT
-         if(profit <= EmergencyLossUSD)
-         {
-            trade.PositionClose(ticket);
-
-            if(DebugPrint)
-               Print("🛑 LOSS EXIT: ", profit);
+            trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
          }
       }
-   }
-}
-
-//+------------------------------------------------------------------+
-bool SpreadOK()
-{
-   double spread =
-      (SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK)
-      -
-      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID))
-      / point;
-
-   return spread <= MaxSpreadPoints;
-}
-
-//+------------------------------------------------------------------+
-bool BuyTrendOK()
-{
-   if(!UseTrendFilter)
-      return true;
-
-   double ema =
-      iMA(
-         SymbolToTrade,
-         PERIOD_M1,
-         EMA_Period,
-         0,
-         MODE_EMA,
-         PRICE_CLOSE
-      );
-
-   double price =
-      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-
-   return price > ema;
-}
-
-//+------------------------------------------------------------------+
-bool SellTrendOK()
-{
-   if(!UseTrendFilter)
-      return true;
-
-   double ema =
-      iMA(
-         SymbolToTrade,
-         PERIOD_M1,
-         EMA_Period,
-         0,
-         MODE_EMA,
-         PRICE_CLOSE
-      );
-
-   double price =
-      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-
-   return price < ema;
-}
-
-//+------------------------------------------------------------------+
-void StoreTick(double price)
-{
-   if(tickCount < 200)
-   {
-      tickPrices[tickCount] = price;
-      tickCount++;
-   }
-   else
-   {
-      for(int i=0; i<199; i++)
-      {
-         tickPrices[i] = tickPrices[i+1];
-      }
-
-      tickPrices[199] = price;
-   }
-}
-
-//+------------------------------------------------------------------+
-double GetLowestTick()
-{
-   double low = DBL_MAX;
-
-   int start =
-      MathMax(0, tickCount - TickLookback);
-
-   for(int i=start; i<tickCount; i++)
-   {
-      if(tickPrices[i] < low)
-         low = tickPrices[i];
-   }
-
-   return low;
-}
-
-//+------------------------------------------------------------------+
-double GetHighestTick()
-{
-   double high = -DBL_MAX;
-
-   int start =
-      MathMax(0, tickCount - TickLookback);
-
-   for(int i=start; i<tickCount; i++)
-   {
-      if(tickPrices[i] > high)
-         high = tickPrices[i];
-   }
-
-   return high;
-}
-
-//+------------------------------------------------------------------+
-void OpenBuy()
-{
-   double ask =
-      SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-
-   bool ok =
-      trade.Buy(
-         FixedLot,
-         SymbolToTrade,
-         ask,
-         0,
-         0,
-         "TICK BUY"
-      );
-
-   if(ok)
-   {
-      lastTradeMs = GetTickCount64();
-
-      if(DebugPrint)
-         Print("🔥 BUY OPENED");
-   }
-   else
-   {
-      Print(
-         "❌ BUY FAILED: ",
-         trade.ResultRetcodeDescription()
-      );
-   }
-}
-
-//+------------------------------------------------------------------+
-void OpenSell()
-{
-   double bid =
-      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-
-   bool ok =
-      trade.Sell(
-         FixedLot,
-         SymbolToTrade,
-         bid,
-         0,
-         0,
-         "TICK SELL"
-      );
-
-   if(ok)
-   {
-      lastTradeMs = GetTickCount64();
-
-      if(DebugPrint)
-         Print("🔥 SELL OPENED");
-   }
-   else
-   {
-      Print(
-         "❌ SELL FAILED: ",
-         trade.ResultRetcodeDescription()
-      );
    }
 }
 
@@ -305,21 +190,18 @@ void OpenSell()
 int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
-
    trade.SetTypeFillingBySymbol(SymbolToTrade);
-
    SymbolSelect(SymbolToTrade, true);
+   point = SymbolInfoDouble(SymbolToTrade, SYMBOL_POINT);
+   initialEquity = AccountInfoDouble(ACCOUNT_EQUITY);
 
-   point =
-      SymbolInfoDouble(
-         SymbolToTrade,
-         SYMBOL_POINT
-      );
-
-   Print("================================");
-   Print("⚡ TICK SCALPER STARTED");
-   Print("================================");
-
+   Print("========================================");
+   Print("EXPONENTIAL SWEEP SCALPER v4 STARTED");
+   Print("Symbol: ", SymbolToTrade, " | Point: ", point);
+   Print("Initial Equity: ", initialEquity);
+   Print("Risk: ", (UseExponentialLot ? "Compound (equity²)" : (string)RiskPercent+"%"));
+   Print("TP: ", TakeProfitPoints*point*10000, " pips | SL: ", StopLossPoints*point*10000, " pips");
+   Print("========================================");
    return(INIT_SUCCEEDED);
 }
 
@@ -328,80 +210,38 @@ void OnTick()
 {
    ManagePositions();
 
-   if(!SpreadOK())
-      return;
+   if(!AllowMultipleTrades && CountPositions() > 0) return;
+   if(CountPositions() >= MaxPositions) return;
 
-   if(!AllowMultiplePositions)
+   // New bar logic (avoid multiple triggers per bar)
+   datetime currentBarTime = iTime(SymbolToTrade, PERIOD_M1, 0);
+   if(currentBarTime == lastBarTime) return;
+   lastBarTime = currentBarTime;
+
+   double lowestLow   = GetLowestLow(2);
+   double highestHigh = GetHighestHigh(2);
+   double currentLow  = iLow(SymbolToTrade, PERIOD_M1, 0);
+   double currentHigh = iHigh(SymbolToTrade, PERIOD_M1, 0);
+   double prevLow     = iLow(SymbolToTrade, PERIOD_M1, 1);
+   double prevHigh    = iHigh(SymbolToTrade, PERIOD_M1, 1);
+
+   // Aggressive sweep triggers (break of recent range)
+   bool buySweep   = (currentLow < (lowestLow - SweepPoints * point));
+   bool sellSweep  = (currentHigh > (highestHigh + SweepPoints * point));
+
+   // Optional: false breakout filter – requires bar to close above/below previous bar
+   if(RequireCloseAbove)
    {
-      if(CountPositions() > 0)
-         return;
+      buySweep  = buySweep && (iClose(SymbolToTrade, PERIOD_M1, 0) > prevHigh);
+      sellSweep = sellSweep && (iClose(SymbolToTrade, PERIOD_M1, 0) < prevLow);
    }
-
-   if(CountPositions() >= MaxPositions)
-      return;
-
-   ulong nowMs = GetTickCount64();
-
-   if(nowMs - lastTradeMs <
-      (ulong)CooldownMilliseconds)
-   {
-      return;
-   }
-
-   double bid =
-      SymbolInfoDouble(SymbolToTrade, SYMBOL_BID);
-
-   double ask =
-      SymbolInfoDouble(SymbolToTrade, SYMBOL_ASK);
-
-   double mid =
-      (bid + ask) / 2.0;
-
-   // STORE LIVE TICK
-   StoreTick(mid);
-
-   if(tickCount < TickLookback)
-      return;
-
-   double lowestTick =
-      GetLowestTick();
-
-   double highestTick =
-      GetHighestTick();
-
-   // AGGRESSIVE MICRO REVERSAL
-
-   bool buySignal =
-      bid <
-      (lowestTick -
-      TickMovePoints * point);
-
-   bool sellSignal =
-      ask >
-      (highestTick +
-      TickMovePoints * point);
 
    if(DebugPrint)
-   {
-      Print(
-         "BID=", bid,
-         " LOWEST=", lowestTick,
-         " ASK=", ask,
-         " HIGHEST=", highestTick
-      );
-   }
+      Print("Low=", currentLow, " LL=", lowestLow, " High=", currentHigh, " HH=", highestHigh,
+            " Buy=", buySweep, " Sell=", sellSweep);
 
-   // BUY
-   if(buySignal && BuyTrendOK())
-   {
-      OpenBuy();
-   }
-
-   // SELL
-   if(sellSignal && SellTrendOK())
-   {
-      OpenSell();
-   }
+   if(buySweep)  OpenBuy();
+   if(sellSweep) OpenSell();
 }
 //+------------------------------------------------------------------+
 EOF
