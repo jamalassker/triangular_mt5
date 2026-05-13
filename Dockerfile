@@ -20,77 +20,65 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # V16.3 - PROFIT-MAX VELOCITY BOT (ULTRA PROFITABILITY)
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
+# =========================================================
+# V17.0 - HFT PULLBACK CONTINUATION SCALPER (AGGRESSIVE)
+# =========================================================
+RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                MicroPullback_Continuation.mq5    |
-//|                     Trend Sniping + Trailing Stop (HFT inspired) |
+//|                                HFT_Pullback_Continuation.mq5     |
+//|                     Aggressive HFT - Pullback to EMA             |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
-#property copyright "PullbackScalper"
-#property version   "2.00"
+#property copyright "HFT Pullback"
+#property version   "6.00"
 
-// --- INPUTS (win‑rate focused) ---
-input double   RiskPercent       = 2.0;        // Risk per trade (2-3%)
-input int      StopLossPips      = 8;          // Fixed stop loss (pips)
-input int      TrailingStartPips = 5;          // Start trailing when profit >=5 pips
-input int      TrailingStepPips  = 3;          // Trail distance (pips)
-input int      LookbackBars      = 20;         // EMA period (M5 for trend)
-input int      PullbackCandles   = 2;          // Max number of pullback candles (1-3)
-input double   PullbackDistance  = 2.0;        // Max distance from EMA (pips)
-input int      MaxDailyLoss      = 3;          // Stop after 3 losses
-input bool     UseSessionFilter  = true;       // London/NY only
+// --- INPUTS (aggressive HFT) ---
+input double   RiskPercent       = 2.0;        // Risk per trade
+input int      StopLossPips      = 0;          // 0 = no fixed stop (trailing stop only)
+input int      TakeProfitPips    = 0;          // 0 = no fixed target
+input int      LookbackBars      = 20;         // EMA period
+input double   PullbackPips      = 2.0;        // Max distance from EMA to consider a pullback (pips)
+input int      TrailingStartPips = 5;          // Start trailing when profit reaches this (pips)
+input int      TrailingStepPips  = 3;          // Trail distance
+input int      MaxDailyLoss      = 20;         // High limit for aggressive trading
+input bool     UseSessionFilter  = false;      // false = 24/7 HFT
 input int      SessionOffset     = 0;
-input int      MaxOpenPositions  = 1;
+input int      MaxOpenPositions  = 10;         // Multiple positions
 
 // --- GLOBALS ---
 CTrade trade;
-int    magic = 20250425;
+int    magic = 20250430;
 int    dailyLoss = 0;
-int    emaHandleM5;          // 5‑min EMA for trend direction
-int    emaHandleM1;          // 1‑min EMA for pullback detection
+int    emaHandle;
 double point, pipValue;
-datetime lastBarTime = 0;    // for 1‑min bar change detection
 int    retryCount = 0;
 datetime lastRetryTime = 0;
 
 //+------------------------------------------------------------------+
-//| Initialization                                                   |
+//| Trade execution (same as working HFT EA)                         |
 //+------------------------------------------------------------------+
-int OnInit()
+bool TradeWithRetry(ENUM_ORDER_TYPE type, double volume, double price, double sl, double tp, string comment)
 {
-   point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
-   pipValue = (digits == 5 || digits == 3) ? point * 10 : point;
-
-   // Create EMA handles
-   emaHandleM5 = iMA(_Symbol, PERIOD_M5, LookbackBars, 0, MODE_EMA, PRICE_CLOSE);
-   emaHandleM1 = iMA(_Symbol, PERIOD_M1, LookbackBars, 0, MODE_EMA, PRICE_CLOSE);
-   if(emaHandleM5 == INVALID_HANDLE || emaHandleM1 == INVALID_HANDLE)
-      return INIT_FAILED;
-
-   // Detect broker filling mode
-   long modes = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
-   ENUM_ORDER_TYPE_FILLING fillMode = ORDER_FILLING_IOC;
-   if((modes & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) fillMode = ORDER_FILLING_IOC;
-   else if((modes & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) fillMode = ORDER_FILLING_FOK;
-   else fillMode = ORDER_FILLING_RETURN;
-
-   trade.SetExpertMagicNumber(magic);
-   trade.SetTypeFilling(fillMode);
-   trade.SetDeviationInPoints(10);
-
-   Print("==========================================");
-   Print("MICRO PULLBACK CONTINUATION SCALPER");
-   Print("Trend: 5-min EMA", LookbackBars);
-   Print("Pullback entry: 1-min touch of EMA", LookbackBars);
-   Print("Stop loss: ", StopLossPips, " pips");
-   Print("Trailing: start at ", TrailingStartPips, " step ", TrailingStepPips);
-   Print("==========================================");
-   return INIT_SUCCEEDED;
+   if(retryCount >= 5) { retryCount = 0; return false; }
+   if(GetTickCount() - lastRetryTime < 1000 && retryCount > 0) return false;
+   double use_sl = (sl == 0) ? 0.0 : sl;
+   double use_tp = (tp == 0) ? 0.0 : tp;
+   bool res = (type == ORDER_TYPE_BUY) ? trade.Buy(volume, _Symbol, price, use_sl, use_tp, comment)
+                                       : trade.Sell(volume, _Symbol, price, use_sl, use_tp, comment);
+   if(!res)
+   {
+      retryCount++;
+      lastRetryTime = GetTickCount();
+      Print("Attempt ", retryCount, " failed. Error: ", GetLastError(), " Retcode: ", trade.ResultRetcode());
+      return false;
+   }
+   retryCount = 0;
+   return true;
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop management (inspired by your code)                 |
+//| Trailing stop management                                         |
 //+------------------------------------------------------------------+
 void ManageTrailingStops()
 {
@@ -108,13 +96,11 @@ void ManageTrailingStops()
          double profitPips = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
                              ? (currentPrice - openPrice) / pipValue
                              : (openPrice - currentPrice) / pipValue;
-
          if(profitPips >= TrailingStartPips)
          {
             double trailPoints = TrailingStepPips * (pipValue / point);
             double newSL = 0;
             bool modify = false;
-
             if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
             {
                newSL = currentPrice - trailPoints * point;
@@ -125,152 +111,124 @@ void ManageTrailingStops()
                newSL = currentPrice + trailPoints * point;
                if(sl == 0 || newSL < sl) modify = true;
             }
-
             if(modify && trade.PositionModify(ticket, newSL, tp))
-               Print("Trailing stop updated on ticket ", ticket, " to ", newSL);
+               Print("Trailing stop updated on ", ticket, " to ", newSL);
          }
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Trade execution with retry (same as your HFT EA)                 |
-//+------------------------------------------------------------------+
-bool TradeWithRetry(ENUM_ORDER_TYPE type, double volume, double price, double sl, double tp, string comment)
+int OnInit()
 {
-   if(retryCount >= 5) { retryCount = 0; return false; }
-   if(GetTickCount() - lastRetryTime < 1000 && retryCount > 0) return false;
-
-   bool res = (type == ORDER_TYPE_BUY)
-              ? trade.Buy(volume, _Symbol, price, sl, tp, comment)
-              : trade.Sell(volume, _Symbol, price, sl, tp, comment);
-
-   if(!res)
-   {
-      retryCount++;
-      lastRetryTime = GetTickCount();
-      Print("Trade attempt ", retryCount, " failed. Error: ", GetLastError(),
-            " | Retcode: ", trade.ResultRetcode());
-      return false;
-   }
-   retryCount = 0;
-   return true;
+   point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   pipValue = (digits == 5 || digits == 3) ? point * 10 : point;
+   emaHandle = iMA(_Symbol, PERIOD_M1, LookbackBars, 0, MODE_EMA, PRICE_CLOSE);
+   if(emaHandle == INVALID_HANDLE) return INIT_FAILED;
+   long modes = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING fillMode = ORDER_FILLING_IOC;
+   if((modes & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) fillMode = ORDER_FILLING_IOC;
+   else if((modes & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) fillMode = ORDER_FILLING_FOK;
+   else fillMode = ORDER_FILLING_RETURN;
+   trade.SetExpertMagicNumber(magic);
+   trade.SetTypeFilling(fillMode);
+   trade.SetDeviationInPoints(10);
+   Print("==========================================");
+   Print("HFT PULLBACK CONTINUATION - AGGRESSIVE");
+   Print("Pullback distance: ", PullbackPips, " pips");
+   Print("Trailing start: ", TrailingStartPips, " step: ", TrailingStepPips);
+   Print("==========================================");
+   return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Main tick handler                                                |
-//+------------------------------------------------------------------+
 void OnTick()
 {
-   // --- Daily loss limit reset ---
+   // Daily loss limit
    static datetime lastDay = 0;
    datetime today = iTime(_Symbol, PERIOD_D1, 0);
    if(today != lastDay) { dailyLoss = 0; lastDay = today; }
    if(dailyLoss >= MaxDailyLoss) return;
-
-   // --- Session filter (London/NY) ---
+   
+   // Session filter
    if(UseSessionFilter)
    {
       MqlDateTime tm; TimeToStruct(TimeCurrent(), tm);
       int hour = (tm.hour + SessionOffset) % 24;
       if(!((hour >= 7 && hour < 10) || (hour >= 12 && hour < 15))) return;
    }
-
-   // --- Position limit ---
+   
+   // Position limit
    if(PositionsTotal() >= MaxOpenPositions) return;
-
-   // --- Manage trailing stops on existing positions ---
+   
+   // Manage trailing stops on existing positions
    ManageTrailingStops();
-
-   // --- Only evaluate new signals on new 1‑min bar ---
-   datetime barTime = iTime(_Symbol, PERIOD_M1, 0);
-   if(barTime == lastBarTime) return;
-   lastBarTime = barTime;
-
-   // --- Get trend direction from 5‑min EMA ---
-   double emaM5[1], emaM5_prev[1];
-   if(CopyBuffer(emaHandleM5, 0, 0, 1, emaM5) < 1) return;
-   if(CopyBuffer(emaHandleM5, 0, 1, 1, emaM5_prev) < 1) return;
-
+   
+   // Get current EMA value
+   double ema[1];
+   if(CopyBuffer(emaHandle, 0, 0, 1, ema) < 1) return;
+   double currentEMA = ema[0];
+   
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-
-   bool uptrend = (ask > emaM5[0]) && (emaM5[0] > emaM5_prev[0]);   // price above rising EMA
-   bool downtrend = (bid < emaM5[0]) && (emaM5[0] < emaM5_prev[0]); // price below falling EMA
-
-   if(!uptrend && !downtrend) return;   // flat market, no signal
-
-   // --- Get 1‑min EMA and recent candlesticks for pullback detection ---
-   double emaM1[1];
-   if(CopyBuffer(emaHandleM1, 0, 0, 1, emaM1) < 1) return;
-   double currentEMA = emaM1[0];
-
-   MqlRates rates[];
-   ArraySetAsSeries(rates, true);
-   if(CopyRates(_Symbol, PERIOD_M1, 0, PullbackCandles+3, rates) < PullbackCandles+2) return;
-
-   // --- Detect pullback to EMA (on 1‑min) ---
-   bool pullbackDetected = false;
-   double pullbackPrice = 0;
-
-   // For uptrend: look for a low that touched near EMA (within PullbackDistance pips)
-   if(uptrend)
+   
+   // --- Trend detection: price relative to EMA and EMA slope
+   double prevEMA[1];
+   if(CopyBuffer(emaHandle, 0, 1, 1, prevEMA) < 1) return;
+   bool uptrend = (ask > currentEMA) && (currentEMA > prevEMA[0]);
+   bool downtrend = (bid < currentEMA) && (currentEMA < prevEMA[0]);
+   
+   // --- Pullback detection: price is within PullbackPips of EMA
+   double askDist = (ask - currentEMA) / pipValue;
+   double bidDist = (currentEMA - bid) / pipValue;
+   bool pullbackBuy = uptrend && (askDist >= 0 && askDist <= PullbackPips);
+   bool pullbackSell = downtrend && (bidDist >= 0 && bidDist <= PullbackPips);
+   
+   // Force trade fallback (every 30 ticks if no pullback)
+   static int forceCounter = 0;
+   forceCounter++;
+   if(forceCounter >= 30 && !pullbackBuy && !pullbackSell)
    {
-      for(int i = 1; i <= PullbackCandles; i++)
-      {
-         double lowDist = (currentEMA - rates[i].low) / pipValue;
-         if(lowDist >= 0 && lowDist <= PullbackDistance)
-         {
-            pullbackDetected = true;
-            pullbackPrice = rates[i].low;
-            break;
-         }
-      }
-      // Also require the current asked price to be above EMA (continuation)
-      if(pullbackDetected && ask > currentEMA)
-      {
-         double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
-         lot = MathMax(0.01, lot);
-         double sl = ask - StopLossPips * pipValue;
-         double tp = 0;   // no fixed TP, rely on trailing stop
-
-         if(TradeWithRetry(ORDER_TYPE_BUY, lot, ask, sl, tp, "PullbackBuy"))
-            Print("🔥 BUY opened | Lot=", lot, " @ ", ask);
-      }
+      forceCounter = 0;
+      if(ask > currentEMA) pullbackBuy = true;
+      else pullbackSell = true;
    }
-   // For downtrend: look for a high that touched near EMA
-   else if(downtrend)
+   
+   Comment(StringFormat("HFT Pullback | EMA=%.5f | BuyDist=%.1f SellDist=%.1f | Buy=%s Sell=%s",
+         currentEMA, askDist, bidDist, pullbackBuy?"★":"-", pullbackSell?"★":"-"));
+   
+   // --- Execute trade if pullback detected
+   if(!pullbackBuy && !pullbackSell) return;
+   
+   double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
+   lot = MathMax(0.01, lot);
+   ENUM_ORDER_TYPE tradeType;
+   double price, sl = 0, tp = 0;
+   string comment;
+   
+   if(pullbackBuy)
    {
-      for(int i = 1; i <= PullbackCandles; i++)
-      {
-         double highDist = (rates[i].high - currentEMA) / pipValue;
-         if(highDist >= 0 && highDist <= PullbackDistance)
-         {
-            pullbackDetected = true;
-            pullbackPrice = rates[i].high;
-            break;
-         }
-      }
-      if(pullbackDetected && bid < currentEMA)
-      {
-         double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
-         lot = MathMax(0.01, lot);
-         double sl = bid + StopLossPips * pipValue;
-         double tp = 0;
-
-         if(TradeWithRetry(ORDER_TYPE_SELL, lot, bid, sl, tp, "PullbackSell"))
-            Print("🔥 SELL opened | Lot=", lot, " @ ", bid);
-      }
+      tradeType = ORDER_TYPE_BUY;
+      price = ask;
+      comment = "PullbackBuy";
    }
-
-   // Debug comment (optional)
-   Comment(StringFormat("Pullback EA | Trend: %s | EMA=%.5f | Pullback: %s",
-         uptrend ? "UP" : (downtrend ? "DOWN" : "FLAT"),
-         currentEMA, pullbackDetected ? "YES" : "NO"));
+   else
+   {
+      tradeType = ORDER_TYPE_SELL;
+      price = bid;
+      comment = "PullbackSell";
+   }
+   
+   bool placed = false;
+   for(int attempt = 0; attempt < 5 && !placed; attempt++)
+   {
+      placed = TradeWithRetry(tradeType, lot, price, sl, tp, comment);
+      if(!placed && attempt < 4) Sleep(50);
+   }
+   if(placed) Print("🔥 Pullback trade: ", EnumToString(tradeType), " Lot=", lot, " @ ", price);
 }
 
-//+------------------------------------------------------------------+
-//| Track daily losses                                               |
 //+------------------------------------------------------------------+
 void OnTradeTransaction(const MqlTradeTransaction &trans,
                         const MqlTradeRequest &request,
@@ -284,6 +242,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    }
 }
 //+------------------------------------------------------------------+
+EOF
 EOF
 
 # ============================================
