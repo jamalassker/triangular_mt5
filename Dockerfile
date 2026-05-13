@@ -25,26 +25,26 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 # =========================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                HFT_Pullback_Continuation.mq5     |
-//|                     Aggressive HFT - Pullback to EMA             |
+//|                                          HFT_Pullback_Continuation.mq5 |
+//|                     Aggressive HFT - Pullback to EMA + Sweep Fixes |
 //+------------------------------------------------------------------+
 #include <Trade\Trade.mqh>
 
 #property copyright "HFT Pullback"
-#property version   "6.00"
+#property version   "6.10"
 
-// --- INPUTS (aggressive HFT) ---
-input double   RiskPercent       = 2.0;        // Risk per trade
-input int      StopLossPips      = 0;          // 0 = no fixed stop (trailing stop only)
+// --- AGGRESSIVE INPUTS ---
+input double   RiskPercent       = 2.0;        // Risk per trade (% of equity)
+input int      StopLossPips      = 0;          // 0 = no fixed stop (trailing only)
 input int      TakeProfitPips    = 0;          // 0 = no fixed target
 input int      LookbackBars      = 20;         // EMA period
-input double   PullbackPips      = 2.0;        // Max distance from EMA to consider a pullback (pips)
+input double   PullbackPips      = 2.0;        // Max distance from EMA (pips)
 input int      TrailingStartPips = 5;          // Start trailing when profit reaches this (pips)
-input int      TrailingStepPips  = 3;          // Trail distance
-input int      MaxDailyLoss      = 20;         // High limit for aggressive trading
-input bool     UseSessionFilter  = false;      // false = 24/7 HFT
+input int      TrailingStepPips  = 3;          // Trail distance (pips)
+input int      MaxDailyLoss      = 20;         // Stop after X losing trades
+input bool     UseSessionFilter  = false;      // false = 24/7 trading
 input int      SessionOffset     = 0;
-input int      MaxOpenPositions  = 10;         // Multiple positions
+input int      MaxOpenPositions  = 10;         // Concurrent positions
 
 // --- GLOBALS ---
 CTrade trade;
@@ -56,21 +56,26 @@ int    retryCount = 0;
 datetime lastRetryTime = 0;
 
 //+------------------------------------------------------------------+
-//| Trade execution (same as working HFT EA)                         |
+//| Trade execution with retry (from sweep strategy)                |
 //+------------------------------------------------------------------+
 bool TradeWithRetry(ENUM_ORDER_TYPE type, double volume, double price, double sl, double tp, string comment)
 {
    if(retryCount >= 5) { retryCount = 0; return false; }
    if(GetTickCount() - lastRetryTime < 1000 && retryCount > 0) return false;
+   
    double use_sl = (sl == 0) ? 0.0 : sl;
    double use_tp = (tp == 0) ? 0.0 : tp;
-   bool res = (type == ORDER_TYPE_BUY) ? trade.Buy(volume, _Symbol, price, use_sl, use_tp, comment)
-                                       : trade.Sell(volume, _Symbol, price, use_sl, use_tp, comment);
+   
+   bool res = (type == ORDER_TYPE_BUY) 
+              ? trade.Buy(volume, _Symbol, price, use_sl, use_tp, comment)
+              : trade.Sell(volume, _Symbol, price, use_sl, use_tp, comment);
+   
    if(!res)
    {
       retryCount++;
       lastRetryTime = GetTickCount();
-      Print("Attempt ", retryCount, " failed. Error: ", GetLastError(), " Retcode: ", trade.ResultRetcode());
+      Print("Trade attempt ", retryCount, " failed. Error: ", GetLastError(),
+            " | Retcode: ", trade.ResultRetcode());
       return false;
    }
    retryCount = 0;
@@ -78,7 +83,7 @@ bool TradeWithRetry(ENUM_ORDER_TYPE type, double volume, double price, double sl
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop management                                         |
+//| Trailing stop management (aggressive locking)                   |
 //+------------------------------------------------------------------+
 void ManageTrailingStops()
 {
@@ -96,19 +101,20 @@ void ManageTrailingStops()
          double profitPips = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
                              ? (currentPrice - openPrice) / pipValue
                              : (openPrice - currentPrice) / pipValue;
+         
          if(profitPips >= TrailingStartPips)
          {
-            double trailPoints = TrailingStepPips * (pipValue / point);
+            double trailPoints = TrailingStepPips * pipValue;
             double newSL = 0;
             bool modify = false;
             if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
             {
-               newSL = currentPrice - trailPoints * point;
+               newSL = currentPrice - trailPoints;
                if(sl == 0 || newSL > sl) modify = true;
             }
             else
             {
-               newSL = currentPrice + trailPoints * point;
+               newSL = currentPrice + trailPoints;
                if(sl == 0 || newSL < sl) modify = true;
             }
             if(modify && trade.PositionModify(ticket, newSL, tp))
@@ -124,20 +130,25 @@ int OnInit()
    point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    pipValue = (digits == 5 || digits == 3) ? point * 10 : point;
+   
    emaHandle = iMA(_Symbol, PERIOD_M1, LookbackBars, 0, MODE_EMA, PRICE_CLOSE);
    if(emaHandle == INVALID_HANDLE) return INIT_FAILED;
+   
    long modes = SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
    ENUM_ORDER_TYPE_FILLING fillMode = ORDER_FILLING_IOC;
    if((modes & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC) fillMode = ORDER_FILLING_IOC;
    else if((modes & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK) fillMode = ORDER_FILLING_FOK;
    else fillMode = ORDER_FILLING_RETURN;
+   
    trade.SetExpertMagicNumber(magic);
    trade.SetTypeFilling(fillMode);
    trade.SetDeviationInPoints(10);
+   
    Print("==========================================");
    Print("HFT PULLBACK CONTINUATION - AGGRESSIVE");
    Print("Pullback distance: ", PullbackPips, " pips");
    Print("Trailing start: ", TrailingStartPips, " step: ", TrailingStepPips);
+   Print("Max positions: ", MaxOpenPositions);
    Print("==========================================");
    return INIT_SUCCEEDED;
 }
@@ -165,27 +176,26 @@ void OnTick()
    // Manage trailing stops on existing positions
    ManageTrailingStops();
    
-   // Get current EMA value
-   double ema[1];
+   // Get current and previous EMA
+   double ema[1], prevEMA[1];
    if(CopyBuffer(emaHandle, 0, 0, 1, ema) < 1) return;
+   if(CopyBuffer(emaHandle, 0, 1, 1, prevEMA) < 1) return;
    double currentEMA = ema[0];
    
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    
-   // --- Trend detection: price relative to EMA and EMA slope
-   double prevEMA[1];
-   if(CopyBuffer(emaHandle, 0, 1, 1, prevEMA) < 1) return;
+   // Trend detection: price above EMA and EMA rising = uptrend
    bool uptrend = (ask > currentEMA) && (currentEMA > prevEMA[0]);
    bool downtrend = (bid < currentEMA) && (currentEMA < prevEMA[0]);
    
-   // --- Pullback detection: price is within PullbackPips of EMA
+   // Pullback detection: price within PullbackPips of EMA
    double askDist = (ask - currentEMA) / pipValue;
    double bidDist = (currentEMA - bid) / pipValue;
    bool pullbackBuy = uptrend && (askDist >= 0 && askDist <= PullbackPips);
    bool pullbackSell = downtrend && (bidDist >= 0 && bidDist <= PullbackPips);
    
-   // Force trade fallback (every 30 ticks if no pullback)
+   // Force trade fallback (every 30 ticks if no signal) – keeps aggressiveness
    static int forceCounter = 0;
    forceCounter++;
    if(forceCounter >= 30 && !pullbackBuy && !pullbackSell)
@@ -195,14 +205,15 @@ void OnTick()
       else pullbackSell = true;
    }
    
-   Comment(StringFormat("HFT Pullback | EMA=%.5f | BuyDist=%.1f SellDist=%.1f | Buy=%s Sell=%s",
-         currentEMA, askDist, bidDist, pullbackBuy?"★":"-", pullbackSell?"★":"-"));
+   Comment(StringFormat("HFT Pullback | EMA=%.5f | BuyDist=%.1f SellDist=%.1f | Buy=%s Sell=%s | Positions=%d",
+         currentEMA, askDist, bidDist, pullbackBuy?"★":"-", pullbackSell?"★":"-", PositionsTotal()));
    
-   // --- Execute trade if pullback detected
    if(!pullbackBuy && !pullbackSell) return;
    
+   // Lot size calculation (2% risk of equity)
    double lot = NormalizeDouble(AccountInfoDouble(ACCOUNT_EQUITY) / 1000.0 * (RiskPercent / 100.0), 2);
    lot = MathMax(0.01, lot);
+   
    ENUM_ORDER_TYPE tradeType;
    double price, sl = 0, tp = 0;
    string comment;
@@ -220,6 +231,7 @@ void OnTick()
       comment = "PullbackSell";
    }
    
+   // Execute with retry (using sweep’s improved TradeWithRetry)
    bool placed = false;
    for(int attempt = 0; attempt < 5 && !placed; attempt++)
    {
@@ -242,7 +254,7 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
    }
 }
 //+------------------------------------------------------------------+
-EOF
+
 EOF
 
 # ============================================
