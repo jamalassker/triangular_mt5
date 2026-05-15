@@ -23,30 +23,30 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                        TickScalper_CentAccount  |
-//|                     Loosened rules, works on every tick         |
+//|                                        TickScalper_ProfitTarget  |
+//|                     Closes at $0.50 profit, no stop loss        |
 //+------------------------------------------------------------------+
 #property copyright "Scalper for $10 Cent Account"
-#property version   "4.00"
+#property version   "5.00"
 #property strict
 
-// --- Inputs (all adjustable) ---
+// --- Inputs ---
 input double   InpRiskPercent        = 2.0;      // Risk per trade (%)
 input double   InpFixedLot           = 0.01;
 input bool     InpUseAutoLot         = true;
 input double   InpMaxDailyLoss       = 20.0;     // Stop after 20% daily loss
 input double   InpMaxDrawdown        = 30.0;
 
-input int      InpFastMA             = 10;       // Fast MA period (M1)
-input int      InpSlowMA             = 30;       // Slow MA period (M1)
+input int      InpFastMA             = 10;
+input int      InpSlowMA             = 30;
 input int      InpRSIPeriod          = 7;
 input int      InpRSIOverbought      = 65;
 input int      InpRSIOversold        = 35;
 
-input double   InpStopLossPips       = 10.0;     // Fixed SL in pips
-input double   InpTakeProfitPips     = 15.0;     // Fixed TP in pips
+input double   InpTakeProfitPips     = 0.0;      // Not used (profit target in USD)
+input double   TargetProfitUSD       = 0.50;     // Close position when profit reaches this amount (USD)
 
-input bool     InpUseTrailing        = false;    // Trailing stop off for simplicity
+input bool     InpUseTrailing        = false;    // Trailing stop disabled (profit target works instead)
 input int      InpTrailingStart      = 5;
 input int      InpTrailingStep       = 3;
 
@@ -54,7 +54,7 @@ input int      InpMagicNumber        = 20251001;
 input int      InpSlippage           = 20;
 input bool     InpPrintLog           = true;
 
-// --- Global variables ---
+// --- Globals ---
 int            fastMAHandle, slowMAHandle, rsiHandle;
 double         fastMA[], slowMA[], rsi[];
 int            expertMagic;
@@ -63,7 +63,6 @@ double         pointValue, pipValue;
 double         dailyStartingBalance;
 bool           isTradingPaused = false;
 bool           drawdownLimitHit = false;
-datetime       lastTradeTime = 0;    // not used for bar, just for optional cooldown
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                           |
@@ -74,10 +73,8 @@ int OnInit()
    expertMagic = InpMagicNumber;
    pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
    pipValue = pointValue * 10;       // for 5-digit brokers
-   
    dailyStartingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    
-   // Indicators on M1 – we'll still use them, but no bar check
    fastMAHandle = iMA(symbol, PERIOD_M1, InpFastMA, 0, MODE_EMA, PRICE_CLOSE);
    slowMAHandle = iMA(symbol, PERIOD_M1, InpSlowMA, 0, MODE_EMA, PRICE_CLOSE);
    rsiHandle    = iRSI(symbol, PERIOD_M1, InpRSIPeriod, PRICE_CLOSE);
@@ -89,7 +86,7 @@ int OnInit()
    ArraySetAsSeries(slowMA, true);
    ArraySetAsSeries(rsi, true);
    
-   Print("Tick Scalper started on ", symbol, " | Risk per trade: ", InpRiskPercent, "%");
+   Print("Tick Scalper (Profit Target $", TargetProfitUSD, ") started on ", symbol);
    return INIT_SUCCEEDED;
 }
 
@@ -105,7 +102,7 @@ void OnDeinit(const int reason)
 }
 
 //+------------------------------------------------------------------+
-//| OnTick – trades on every tick, no bar restriction               |
+//| OnTick – trades on every tick                                   |
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -117,22 +114,23 @@ void OnTick()
    if(CheckDailyLossLimit()) return;
    if(CheckDrawdownLimit()) return;
    
-   // --- Update indicators (every tick) ---
+   // --- Close profitable positions at target ---
+   CheckAndCloseProfitablePositions();
+   
+   // --- Update indicators ---
    if(!UpdateIndicators()) return;
    
    double fast = fastMA[0];
    double slow = slowMA[0];
    double rsiVal = rsi[0];
    
-   // --- Simple trend detection (loose) ---
    bool uptrend = (fast > slow);
    bool downtrend = (fast < slow);
    
-   // --- Entry conditions (very loose, no momentum requirement) ---
    bool buySignal = false;
    bool sellSignal = false;
    
-   // Buy: price above fast MA OR RSI not overbought
+   // Loose entry conditions
    if(uptrend)
    {
       double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
@@ -141,13 +139,11 @@ void OnTick()
    }
    else
    {
-      // even in downtrend, buy if price is above MA (pullback) and RSI not overbought
       double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
       if(bid > fastMA[0] && rsiVal < InpRSIOverbought)
          buySignal = true;
    }
    
-   // Sell: price below fast MA OR RSI not oversold
    if(downtrend)
    {
       double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
@@ -161,19 +157,19 @@ void OnTick()
          sellSignal = true;
    }
    
-   // --- Execute (only one position at a time for safety) ---
+   // Execute only one position at a time
    if(buySignal && CountOpenPositions() == 0)
       OpenBuy();
    if(sellSignal && CountOpenPositions() == 0)
       OpenSell();
    
-   // --- Trailing stop ---
+   // Optional trailing stop (disabled by default, but kept for compatibility)
    if(InpUseTrailing)
       ManageTrailingStops();
 }
 
 //+------------------------------------------------------------------+
-//| Open Buy – with full error handling                             |
+//| Open Buy – NO stop loss, only take profit target in USD         |
 //+------------------------------------------------------------------+
 void OpenBuy()
 {
@@ -181,15 +177,10 @@ void OpenBuy()
    if(lotSize <= 0) return;
    
    double entry = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double sl = entry - InpStopLossPips * pipValue;
-   double tp = entry + InpTakeProfitPips * pipValue;
-   
-   // Enforce minimum stop distance
-   long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   long freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
-   double minDist = MathMax(stopsLevel, freezeLevel) * pointValue + 2 * pointValue;
-   if(entry - sl < minDist) sl = entry - minDist;
-   if(tp - entry < minDist) tp = entry + minDist;
+   // No stop loss
+   double sl = 0;
+   // Take profit is not set (we close by profit target in USD)
+   double tp = 0;
    
    // Auto-detect filling mode
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
@@ -220,7 +211,7 @@ void OpenBuy()
    {
       if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
       {
-         if(InpPrintLog) Print("BUY opened | Lot:", lotSize, " Entry:", entry, " SL:", sl, " TP:", tp);
+         if(InpPrintLog) Print("BUY opened | Lot:", lotSize, " Entry:", entry);
       }
       else
       {
@@ -234,7 +225,7 @@ void OpenBuy()
 }
 
 //+------------------------------------------------------------------+
-//| Open Sell – symmetric                                            |
+//| Open Sell – NO stop loss                                        |
 //+------------------------------------------------------------------+
 void OpenSell()
 {
@@ -242,14 +233,8 @@ void OpenSell()
    if(lotSize <= 0) return;
    
    double entry = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double sl = entry + InpStopLossPips * pipValue;
-   double tp = entry - InpTakeProfitPips * pipValue;
-   
-   long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   long freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
-   double minDist = MathMax(stopsLevel, freezeLevel) * pointValue + 2 * pointValue;
-   if(sl - entry < minDist) sl = entry + minDist;
-   if(entry - tp < minDist) tp = entry - minDist;
+   double sl = 0;
+   double tp = 0;
    
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
    ENUM_ORDER_TYPE_FILLING filling;
@@ -279,7 +264,7 @@ void OpenSell()
    {
       if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
       {
-         if(InpPrintLog) Print("SELL opened | Lot:", lotSize, " Entry:", entry, " SL:", sl, " TP:", tp);
+         if(InpPrintLog) Print("SELL opened | Lot:", lotSize, " Entry:", entry);
       }
       else
       {
@@ -293,7 +278,29 @@ void OpenSell()
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size – never zero                                  |
+//| Close any position with profit >= TargetProfitUSD               |
+//+------------------------------------------------------------------+
+void CheckAndCloseProfitablePositions()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != symbol || PositionGetInteger(POSITION_MAGIC) != expertMagic)
+         continue;
+      
+      double profit = PositionGetDouble(POSITION_PROFIT);  // Profit in account currency (USD for cent accounts)
+      if(profit >= TargetProfitUSD)
+      {
+         // Close this position
+         ClosePosition(ticket);
+         if(InpPrintLog) Print("Closed profitable position | Ticket:", ticket, " Profit: $", profit);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Calculate lot size (unchanged)                                  |
 //+------------------------------------------------------------------+
 double CalculateLotSize()
 {
@@ -302,10 +309,11 @@ double CalculateLotSize()
    {
       double balance = AccountInfoDouble(ACCOUNT_BALANCE);
       double riskAmount = balance * InpRiskPercent / 100.0;
-      double slPips = InpStopLossPips;
+      // Use a fixed stop loss distance for risk calculation (e.g., 10 pips)
+      double stopPips = 10.0;
+      double slDistance = stopPips * pipValue;
       double tickVal = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
       double tickSiz = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-      double slDistance = slPips * pipValue;
       double slTicks = slDistance / tickSiz;
       if(slTicks > 0 && tickVal > 0)
       {
@@ -320,7 +328,6 @@ double CalculateLotSize()
    if(lot < minLot || lot <= 0) lot = minLot;
    if(lot > maxLot) lot = maxLot;
    
-   // Extra safety for tiny accounts: cap lot to balance/500 (risk control)
    double maxAllowed = AccountInfoDouble(ACCOUNT_BALANCE) / 200.0;
    if(lot > maxAllowed) lot = maxAllowed;
    
@@ -330,7 +337,7 @@ double CalculateLotSize()
 }
 
 //+------------------------------------------------------------------+
-//| Count own positions                                              |
+//| Count own positions                                             |
 //+------------------------------------------------------------------+
 int CountOpenPositions()
 {
@@ -347,7 +354,7 @@ int CountOpenPositions()
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop (optional)                                        |
+//| Manage trailing stops (optional, disabled by default)           |
 //+------------------------------------------------------------------+
 void ManageTrailingStops()
 {
@@ -371,7 +378,7 @@ void ManageTrailingStops()
          if(profitPips >= InpTrailingStart)
          {
             newSL = price - InpTrailingStep * pipValue;
-            if(newSL > sl) ModifyStopLoss(t, newSL);
+            if(newSL > sl && sl != 0) ModifyStopLoss(t, newSL);
          }
       }
       else
@@ -381,11 +388,12 @@ void ManageTrailingStops()
          if(profitPips >= InpTrailingStart)
          {
             newSL = price + InpTrailingStep * pipValue;
-            if(newSL < sl || sl == 0) ModifyStopLoss(t, newSL);
+            if((newSL < sl || sl == 0) && sl != 0) ModifyStopLoss(t, newSL);
          }
       }
    }
 }
+
 void ModifyStopLoss(ulong ticket, double newSL)
 {
    MqlTradeRequest req = {};
@@ -401,7 +409,7 @@ void ModifyStopLoss(ulong ticket, double newSL)
 }
 
 //+------------------------------------------------------------------+
-//| Update indicators (M1)                                           |
+//| Update indicators                                               |
 //+------------------------------------------------------------------+
 bool UpdateIndicators()
 {
@@ -412,7 +420,31 @@ bool UpdateIndicators()
 }
 
 //+------------------------------------------------------------------+
-//| Daily loss & drawdown limits                                    |
+//| Close position (used by profit target and drawdown)             |
+//+------------------------------------------------------------------+
+void ClosePosition(ulong ticket)
+{
+   if(!PositionSelectByTicket(ticket)) return;
+   MqlTradeRequest req = {};
+   MqlTradeResult res = {};
+   req.action = TRADE_ACTION_DEAL;
+   req.position = ticket;
+   req.symbol = symbol;
+   req.volume = PositionGetDouble(POSITION_VOLUME);
+   req.deviation = InpSlippage;
+   req.magic = expertMagic;
+   req.comment = "Close profit target or drawdown";
+   if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+      req.type = ORDER_TYPE_SELL;
+   else
+      req.type = ORDER_TYPE_BUY;
+   req.price = (req.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
+   if(!OrderSend(req, res))
+      Print("Close error: ", res.retcode);
+}
+
+//+------------------------------------------------------------------+
+//| Daily loss & drawdown limits (unchanged)                        |
 //+------------------------------------------------------------------+
 bool CheckDailyLossLimit()
 {
@@ -435,6 +467,7 @@ bool CheckDailyLossLimit()
    }
    return false;
 }
+
 bool CheckDrawdownLimit()
 {
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
@@ -444,42 +477,17 @@ bool CheckDrawdownLimit()
    {
       Print("Drawdown limit hit – closing all positions");
       drawdownLimitHit = true;
-      CloseAllPositions();
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+      {
+         ulong t = PositionGetTicket(i);
+         if(PositionSelectByTicket(t) && PositionGetString(POSITION_SYMBOL) == symbol && PositionGetInteger(POSITION_MAGIC) == expertMagic)
+            ClosePosition(t);
+      }
       return true;
    }
    return false;
 }
-void CloseAllPositions()
-{
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong t = PositionGetTicket(i);
-      if(PositionSelectByTicket(t) && PositionGetString(POSITION_SYMBOL) == symbol && PositionGetInteger(POSITION_MAGIC) == expertMagic)
-         ClosePosition(t);
-   }
-}
-void ClosePosition(ulong ticket)
-{
-   if(!PositionSelectByTicket(ticket)) return;
-   MqlTradeRequest req = {};
-   MqlTradeResult res = {};
-   req.action = TRADE_ACTION_DEAL;
-   req.position = ticket;
-   req.symbol = symbol;
-   req.volume = PositionGetDouble(POSITION_VOLUME);
-   req.deviation = InpSlippage;
-   req.magic = expertMagic;
-   req.comment = "Close drawdown";
-   if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
-      req.type = ORDER_TYPE_SELL;
-   else
-      req.type = ORDER_TYPE_BUY;
-   req.price = (req.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
-   if(!OrderSend(req, res))
-      Print("Close error: ", res.retcode);
-}
 //+------------------------------------------------------------------+
-EOF
 
 # ============================================================
 # ENTRYPOINT SCRIPT
