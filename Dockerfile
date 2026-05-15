@@ -27,7 +27,7 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //|                Closes instantly at $0.50 profit                  |
 //+------------------------------------------------------------------+
 #property copyright "Scalper for $10 Cent Account"
-#property version   "6.00"
+#property version   "6.10"
 #property strict
 
 // --- Inputs ---
@@ -42,6 +42,9 @@ input int      InpRSIOverbought      = 65;
 input int      InpRSIOversold        = 35;
 
 input double   TargetProfitUSD       = 0.50;
+
+// GOLD STOP LOSS
+input double   InpStopLossPoints     = 3000;
 
 input bool     InpUseTrailing        = false;
 input int      InpTrailingStart      = 5;
@@ -189,6 +192,9 @@ void OpenBuy()
 
    double entry = SymbolInfoDouble(symbol, SYMBOL_ASK);
 
+   // GOLD STOP LOSS
+   double sl = entry - (InpStopLossPoints * pointValue);
+
    ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_IOC;
 
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
@@ -211,7 +217,7 @@ void OpenBuy()
    req.volume       = lotSize;
    req.type         = ORDER_TYPE_BUY;
    req.price        = entry;
-   req.sl           = 0;
+   req.sl           = NormalizeDouble(sl, _Digits);
    req.tp           = 0;
    req.deviation    = InpSlippage;
    req.magic        = expertMagic;
@@ -225,7 +231,8 @@ void OpenBuy()
       {
          if(InpPrintLog)
             Print("BUY OPENED | Lot: ", lotSize,
-                  " | Price: ", entry);
+                  " | Price: ", entry,
+                  " | SL: ", req.sl);
       }
       else
       {
@@ -250,6 +257,9 @@ void OpenSell()
 
    double entry = SymbolInfoDouble(symbol, SYMBOL_BID);
 
+   // GOLD STOP LOSS
+   double sl = entry + (InpStopLossPoints * pointValue);
+
    ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_IOC;
 
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
@@ -272,7 +282,7 @@ void OpenSell()
    req.volume       = lotSize;
    req.type         = ORDER_TYPE_SELL;
    req.price        = entry;
-   req.sl           = 0;
+   req.sl           = NormalizeDouble(sl, _Digits);
    req.tp           = 0;
    req.deviation    = InpSlippage;
    req.magic        = expertMagic;
@@ -286,7 +296,8 @@ void OpenSell()
       {
          if(InpPrintLog)
             Print("SELL OPENED | Lot: ", lotSize,
-                  " | Price: ", entry);
+                  " | Price: ", entry,
+                  " | SL: ", req.sl);
       }
       else
       {
