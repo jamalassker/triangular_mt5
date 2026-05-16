@@ -19,15 +19,15 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # ============================================================
-# MEAN REVERSION EA – TICK‑BASED + MAX OPEN POSITIONS INPUT
+# MEAN REVERSION EA – TICK‑BASED + IMMEDIATE TRADING
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
 //|                                       MeanReversion_TickBased   |
-//|                            Trades on every tick, no bar waiting |
+//|                     Trades on every tick – no waiting for bars  |
 //+------------------------------------------------------------------+
 #property copyright "Statistical Edge"
-#property version   "4.00"
+#property version   "4.10"
 #property strict
 
 //==================== INPUTS ====================
@@ -54,8 +54,7 @@ input int      InpMagicNumber         = 99001;
 input int      InpSlippage            = 20;
 input bool     InpPrintLog            = true;
 
-// --- NEW INPUT: Maximum number of open positions ---
-input int      InpMaxOpenPositions    = 1;       // Max concurrent positions (0 = unlimited)
+input int      InpMaxOpenPositions    = 1;
 
 //==================== GLOBALS ====================
 string         symbol;
@@ -142,13 +141,31 @@ void OnTick()
    double currentPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
    double mean, stddev;
 
-   if(!CalcMeanStdDev(priceHistory, mean, stddev) || stddev <= 0)
+   // Try to compute real statistics from history
+   bool statsOK = CalcMeanStdDev(priceHistory, mean, stddev) && (stddev > 0);
+   if(!statsOK || stddev <= 0)
    {
-      if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) == 1)
+      // Fallback: use ATR if available, else 10 points
+      if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) == 1 && atrBuf[0] > 0)
          stddev = atrBuf[0];
       else
-         stddev = 10 * pointValue;
-      mean = currentPrice;
+         stddev = 10 * pointValue;          // 1 pip (10 points) immediate trading
+      mean = priceHistory[0];                // last close as reference
+   }
+
+   // === IMMEDIATE TRADING FIX ===
+   // If all prices in history are identical (no movement yet), force a small stddev
+   // so that even a tiny price change creates a Z‑Score.
+   double firstPrice = priceHistory[0];
+   bool allEqual = true;
+   for(int i=1; i<ArraySize(priceHistory); i++)
+   {
+      if(priceHistory[i] != firstPrice) { allEqual = false; break; }
+   }
+   if(allEqual || stddev <= pointValue)
+   {
+      stddev = 10 * pointValue;    // 1 pip
+      mean = firstPrice;
    }
 
    double rawZ = (currentPrice - mean) / stddev;
@@ -163,7 +180,6 @@ void OnTick()
    bool buySignal  = (filteredZ <= -InpEntryZScore);
    bool sellSignal = (filteredZ >=  InpEntryZScore);
 
-   // --- Use InpMaxOpenPositions to allow multiple concurrent trades ---
    int currentPositions = CountPositions();
    if(currentPositions < InpMaxOpenPositions)
    {
@@ -228,9 +244,7 @@ void ExitWhenMeanReached(double currentZ)
       if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
       double profit = PositionGetDouble(POSITION_PROFIT);
       if(profit > 0 && MathAbs(currentZ) <= InpExitZScore)
-      {
          ClosePosition(ticket);
-      }
    }
 }
 
