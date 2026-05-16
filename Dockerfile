@@ -250,95 +250,168 @@ void ExitWhenMeanReached(double currentZ)
 //+------------------------------------------------------------------+
 //| Open order – FIXED for error 4756                               |
 //+------------------------------------------------------------------+
+# KEEP YOUR ORIGINAL FILE EXACTLY THE SAME
+# ONLY REPLACE THE EXISTING OpenOrder() FUNCTION
+# WITH THIS FIXED VERSION BELOW
+
+//+------------------------------------------------------------------+
+//| Open order – FIXED for error 4756                               |
+//+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
    double lot = CalculateLot();
    if(lot <= 0) return;
 
-   double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK)
-                                           : SymbolInfoDouble(symbol, SYMBOL_BID);
-   // Normalize entry price to digits
-   price = NormalizeDouble(price, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
 
+   double ask   = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid   = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double price = (type == ORDER_TYPE_BUY) ? ask : bid;
+
+   price = NormalizeDouble(price, digits);
+
+   // ============================================================
+   // FIX INVALID STOPS (4756)
+   // ============================================================
+
+   long stopsLevel  = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   long freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+
+   double brokerMin = MathMax(stopsLevel, freezeLevel) * pointValue;
+
+   // extra safety buffer
+   brokerMin += (5 * pointValue);
+
+   // strategy SL distance
    double slDistance = (InpStopLossZScore - InpEntryZScore) * stddev;
-   // MINIMUM SL DISTANCE: 10 points (1 pip on 5-digit brokers)
-   double minSLPoints = 10.0 * pointValue;
-   if(slDistance < minSLPoints) slDistance = minSLPoints;
 
+   // ensure SL respects broker minimum
+   if(slDistance < brokerMin)
+      slDistance = brokerMin;
+
+   // TP
    double tpDistance = slDistance * 1.5;
 
-   double sl, tp;
+   double sl = 0;
+   double tp = 0;
+
    if(type == ORDER_TYPE_BUY)
    {
       sl = price - slDistance;
       tp = price + tpDistance;
+
+      if((price - sl) < brokerMin)
+         sl = price - brokerMin;
+
+      if((tp - price) < brokerMin)
+         tp = price + brokerMin;
    }
    else
    {
       sl = price + slDistance;
       tp = price - tpDistance;
+
+      if((sl - price) < brokerMin)
+         sl = price + brokerMin;
+
+      if((price - tp) < brokerMin)
+         tp = price - brokerMin;
    }
 
-   // Enforce broker's minimum stop level
-   long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = stopsLevel * pointValue;
-   if(minDist < minSLPoints) minDist = minSLPoints;
-
-   if(type == ORDER_TYPE_BUY)
-   {
-      if(price - sl < minDist) sl = price - minDist;
-      if(tp - price < minDist) tp = price + minDist;
-   }
-   else
-   {
-      if(sl - price < minDist) sl = price + minDist;
-      if(price - tp < minDist) tp = price - minDist;
-   }
-
-   // Normalize SL and TP
-   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    sl = NormalizeDouble(sl, digits);
    tp = NormalizeDouble(tp, digits);
 
-   // Final safety: SL and TP must be different from entry price
-   if(sl == price) sl = (type == ORDER_TYPE_BUY) ? price - minDist : price + minDist;
-   if(tp == price) tp = (type == ORDER_TYPE_BUY) ? price + minDist : price - minDist;
+   // ============================================================
+   // FILLING MODE
+   // ============================================================
 
-   // Auto-detect filling mode
+   ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_RETURN;
+
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-   ENUM_ORDER_TYPE_FILLING filling;
+
    if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
       filling = ORDER_FILLING_IOC;
    else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
       filling = ORDER_FILLING_FOK;
-   else
-      filling = ORDER_FILLING_RETURN;
 
-   MqlTradeRequest req = {};
-   MqlTradeResult res = {};
-   req.action = TRADE_ACTION_DEAL;
-   req.symbol = symbol;
-   req.volume = lot;
-   req.type = type;
-   req.price = price;
-   req.sl = sl;
-   req.tp = tp;
-   req.deviation = InpSlippage;
-   req.magic = InpMagicNumber;
-   req.comment = (type == ORDER_TYPE_BUY) ? "MeanRev BUY" : "MeanRev SELL";
+   // ============================================================
+   // CREATE REQUEST
+   // ============================================================
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+
+   ZeroMemory(req);
+   ZeroMemory(res);
+
+   req.action       = TRADE_ACTION_DEAL;
+   req.symbol       = symbol;
+   req.magic        = InpMagicNumber;
+   req.volume       = lot;
+   req.type         = type;
+   req.price        = price;
+   req.sl           = sl;
+   req.tp           = tp;
+   req.deviation    = InpSlippage;
    req.type_filling = filling;
+   req.comment      = (type == ORDER_TYPE_BUY)
+                      ? "MeanRev BUY"
+                      : "MeanRev SELL";
+
+   // ============================================================
+   // ORDER CHECK BEFORE SEND
+   // ============================================================
+
+   MqlTradeCheckResult check;
+   ZeroMemory(check);
+
+   if(!OrderCheck(req, check))
+   {
+      Print("OrderCheck failed: ", GetLastError());
+      return;
+   }
+
+   if(check.retcode != TRADE_RETCODE_DONE)
+   {
+      Print("OrderCheck reject retcode=", check.retcode,
+            " | price=", price,
+            " | sl=", sl,
+            " | tp=", tp,
+            " | brokerMin=", brokerMin);
+      return;
+   }
+
+   // ============================================================
+   // SEND ORDER
+   // ============================================================
 
    if(OrderSend(req, res))
    {
-      if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
-         Print((type==ORDER_TYPE_BUY)?"📈 BUY":"📉 SELL", " Lot=", lot, " Z=", DoubleToString(zScore,2));
+      if(res.retcode == TRADE_RETCODE_DONE ||
+         res.retcode == TRADE_RETCODE_PLACED)
+      {
+         Print((type == ORDER_TYPE_BUY)
+               ? "📈 BUY"
+               : "📉 SELL",
+               " Lot=", lot,
+               " Z=", DoubleToString(zScore,2),
+               " SL=", DoubleToString(sl,digits),
+               " TP=", DoubleToString(tp,digits));
+      }
       else
-         Print("Order reject | retcode=", res.retcode);
+      {
+         Print("Order rejected | retcode=",
+               res.retcode,
+               " | comment=",
+               res.comment);
+      }
    }
    else
-      Print("OrderSend error: ", GetLastError());
+   {
+      Print("OrderSend failed | error=", GetLastError());
+   }
 }
-
+//+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
 //| Calculate lot size (fixed ATR error)                            |
 //+------------------------------------------------------------------+
