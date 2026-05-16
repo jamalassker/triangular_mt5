@@ -23,32 +23,32 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|              AI Adaptive Crypto Scalper (MT5)                    |
-//|        BTCUSD / ETHUSD Smart Momentum Scalper                    |
+//|              AI Adaptive Crypto Scalper (AGGRESSIVE)             |
+//|               BTCUSD / ETHUSD High Frequency EA                  |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "2.00"
+#property version   "3.00"
 
 // ================= INPUTS =================
 input double RiskPercent              = 1.0;
 input double FixedLot                 = 0.01;
 input bool   UseAutoLot               = true;
 
-input double ProfitATRMultiplier      = 1.2;
-input double StopATRMultiplier        = 1.5;
+input double ProfitATRMultiplier      = 0.8;
+input double StopATRMultiplier        = 1.2;
 
-input int    FastEMA                  = 20;
-input int    SlowEMA                  = 50;
+input int    FastEMA                  = 9;
+input int    SlowEMA                  = 21;
 
-input int    RSI_Period               = 14;
+input int    RSI_Period               = 7;
 input int    ATR_Period               = 14;
 
-input int    MaxSpreadPoints          = 5000;
+input int    MaxSpreadPoints          = 8000;
 
-input double VolumeMultiplier         = 1.5;
-input double MaxVolatilityMultiplier  = 2.0;
+input double VolumeMultiplier         = 0.8;
+input double MaxVolatilityMultiplier  = 5.0;
 
-input int    ConsecutiveLossLimit     = 3;
+input int    ConsecutiveLossLimit     = 10;
 
 input int    MagicNumber              = 99001;
 input int    Slippage                 = 20;
@@ -104,7 +104,7 @@ int OnInit()
    ArraySetAsSeries(rsiBuffer, true);
    ArraySetAsSeries(atrBuffer, true);
 
-   Print("AI Adaptive Crypto Scalper Started on ", symbol);
+   Print("AGGRESSIVE AI Crypto Scalper Started on ", symbol);
 
    return INIT_SUCCEEDED;
 }
@@ -134,16 +134,10 @@ void OnTick()
    if(GetSpreadPoints() > MaxSpreadPoints)
       return;
 
-   if(consecutiveLosses >= ConsecutiveLossLimit)
-      return;
-
-   if(CountPositions() > 0)
-      return;
-
    if(!UpdateIndicators())
       return;
 
-   // ================= AI-LIKE FILTERS =================
+   CheckClosedTrades();
 
    double fast = fastEMA[0];
    double slow = slowEMA[0];
@@ -154,74 +148,71 @@ void OnTick()
 
    double atr = atrBuffer[0];
 
-   double avgATR = GetAverageATR();
-
-   // Volatility filter
-   if(atr > avgATR * MaxVolatilityMultiplier)
-   {
-      if(PrintLogs)
-         Print("Skipping trade due to extreme volatility");
-
-      return;
-   }
-
-   // Anti-chop filter
-   if(MathAbs(fast - slow) < atr * 0.3)
-   {
-      if(PrintLogs)
-         Print("Skipping due to weak trend");
-
-      return;
-   }
-
-   // Momentum slope
    double slope = fast - prevFast;
 
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
-   // Volume spike
    double currentVolume = iVolume(symbol, PERIOD_M1, 0);
    double avgVolume     = GetAverageVolume();
 
-   bool volumeStrong = currentVolume > (avgVolume * VolumeMultiplier);
+   bool volumeStrong = currentVolume >= (avgVolume * VolumeMultiplier);
 
    bool buySignal = false;
    bool sellSignal = false;
 
-   // ================= BUY CONDITIONS =================
+   // ================= AGGRESSIVE BUY =================
    if(EnableBuy)
    {
-      if(fast > slow &&
-         slope > 0 &&
-         rsi > 45 &&
-         rsi < 70 &&
-         volumeStrong)
+      if(
+         (
+            fast > slow ||
+            slope > 0 ||
+            rsi > 40
+         )
+         &&
+         volumeStrong
+      )
       {
          buySignal = true;
       }
    }
 
-   // ================= SELL CONDITIONS =================
+   // ================= AGGRESSIVE SELL =================
    if(EnableSell)
    {
-      if(fast < slow &&
-         slope < 0 &&
-         rsi < 55 &&
-         rsi > 30 &&
-         volumeStrong)
+      if(
+         (
+            fast < slow ||
+            slope < 0 ||
+            rsi < 60
+         )
+         &&
+         volumeStrong
+      )
       {
          sellSignal = true;
       }
    }
 
-   if(buySignal)
-      OpenBuy(atr);
+   // Force more trades during flat market
+   if(!buySignal && !sellSignal)
+   {
+      if(rsi > 50)
+         buySignal = true;
+      else
+         sellSignal = true;
+   }
 
-   if(sellSignal)
-      OpenSell(atr);
+   // Multiple positions allowed
+   if(CountPositions() < 3)
+   {
+      if(buySignal)
+         OpenBuy(atr);
 
-   CheckClosedTrades();
+      if(sellSignal)
+         OpenSell(atr);
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -258,7 +249,11 @@ void OpenBuy(double atr)
    if(OrderSend(req, res))
    {
       if(PrintLogs)
-         Print("BUY OPENED | Lot:", lot);
+      {
+         Print("BUY OPENED | Lot:", lot,
+               " | RSI:", rsiBuffer[0],
+               " | ATR:", atr);
+      }
    }
    else
    {
@@ -300,7 +295,11 @@ void OpenSell(double atr)
    if(OrderSend(req, res))
    {
       if(PrintLogs)
-         Print("SELL OPENED | Lot:", lot);
+      {
+         Print("SELL OPENED | Lot:", lot,
+               " | RSI:", rsiBuffer[0],
+               " | ATR:", atr);
+      }
    }
    else
    {
@@ -309,16 +308,18 @@ void OpenSell(double atr)
 }
 
 //+------------------------------------------------------------------+
-//| CALCULATE LOT                                                    |
+//| LOT SIZE                                                         |
 //+------------------------------------------------------------------+
 double CalculateLotSize(double atr)
 {
    if(!UseAutoLot)
       return FixedLot;
 
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double balance =
+      AccountInfoDouble(ACCOUNT_BALANCE);
 
-   double riskMoney = balance * RiskPercent / 100.0;
+   double riskMoney =
+      balance * RiskPercent / 100.0;
 
    double tickValue =
       SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
@@ -328,8 +329,9 @@ double CalculateLotSize(double atr)
 
    double slDistance = atr * StopATRMultiplier;
 
-   double lot = riskMoney /
-                ((slDistance / pointValue) * tickValue);
+   double lot =
+      riskMoney /
+      ((slDistance / pointValue) * tickValue);
 
    double minLot =
       SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
@@ -404,19 +406,6 @@ int GetSpreadPoints()
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
    return (int)((ask - bid) / pointValue);
-}
-
-//+------------------------------------------------------------------+
-//| AVERAGE ATR                                                      |
-//+------------------------------------------------------------------+
-double GetAverageATR()
-{
-   double total = 0;
-
-   for(int i=0; i<10; i++)
-      total += atrBuffer[i];
-
-   return total / 10.0;
 }
 
 //+------------------------------------------------------------------+
