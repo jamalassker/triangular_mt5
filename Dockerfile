@@ -243,8 +243,20 @@ void OpenBuy(double atr)
    req.sl           = NormalizeDouble(sl, _Digits);
    req.tp           = NormalizeDouble(tp, _Digits);
    req.deviation    = Slippage;
-   req.type_filling = ORDER_FILLING_IOC;
-   req.comment      = "AI BUY";
+ENUM_ORDER_TYPE_FILLING filling;
+
+int fillMode =
+   (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+
+if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
+   filling = ORDER_FILLING_IOC;
+else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
+   filling = ORDER_FILLING_FOK;
+else
+   filling = ORDER_FILLING_RETURN;
+
+req.type_filling = filling;
+req.comment      = "AI BUY";
 
    if(OrderSend(req, res))
    {
