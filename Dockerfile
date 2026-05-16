@@ -23,8 +23,8 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                         MeanReversion_FastStart  |
-//|                              No waiting – trades within 1 minute |
+//|                                       MeanReversion_FastStart  |
+//|                                No waiting – trades within 1 minute |
 //+------------------------------------------------------------------+
 #property copyright "Statistical Edge"
 #property version   "3.03"
@@ -275,7 +275,7 @@ void ExitWhenMeanReached(double currentZ)
 }
 
 //+------------------------------------------------------------------+
-//| FIXED OPEN ORDER (4756 FIX)                                     |
+//| FIXED OPEN ORDER (4756 FIX)                                      |
 //+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
@@ -384,6 +384,21 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
    req.comment      = "MeanRev";
 
    // ============================================================
+   // CRITICAL OVERRIDES FOR ERROR 4756 (MARKET EXECUTION & FILL MODE)
+   // ============================================================
+   long exeMode = SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE);
+   if(exeMode == SYMBOL_TRADE_EXECUTION_MARKET)
+   {
+      req.price = 0;
+      req.sl = 0;
+      req.tp = 0;
+   }
+   if((fillMode & SYMBOL_FILLING_FOK) != 0)          req.type_filling = ORDER_FILLING_FOK;
+   else if((fillMode & SYMBOL_FILLING_IOC) != 0)     req.type_filling = ORDER_FILLING_IOC;
+   else if(exeMode == SYMBOL_TRADE_EXECUTION_MARKET) req.type_filling = ORDER_FILLING_FOK;
+   else                                              req.type_filling = ORDER_FILLING_RETURN;
+
+   // ============================================================
    // ORDER CHECK
    // ============================================================
 
@@ -420,6 +435,45 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
          Print("TRADE OPENED | price=", price,
                " sl=", sl,
                " tp=", tp);
+
+         // Apply StopLoss and TakeProfit via a post-deal modification if in Market Execution mode
+         if(exeMode == SYMBOL_TRADE_EXECUTION_MARKET && (sl > 0 || tp > 0))
+         {
+            ulong position_ticket = res.position;
+            if(position_ticket == 0) position_ticket = res.order;
+            if(position_ticket == 0)
+            {
+               for(int i=0; i<PositionsTotal(); i++)
+               {
+                  ulong t = PositionGetTicket(i);
+                  if(PositionSelectByTicket(t))
+                  {
+                     if(PositionGetString(POSITION_SYMBOL) == symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+                     {
+                        if(PositionGetDouble(POSITION_SL) == 0 && PositionGetDouble(POSITION_TP) == 0)
+                        {
+                           position_ticket = t;
+                           break;
+                        }
+                     }
+                  }
+               }
+            }
+            if(position_ticket > 0)
+            {
+               MqlTradeRequest mod_req;
+               MqlTradeResult  mod_res;
+               ZeroMemory(mod_req);
+               ZeroMemory(mod_res);
+               mod_req.action   = TRADE_ACTION_SLTP;
+               mod_req.position = position_ticket;
+               mod_req.symbol   = symbol;
+               mod_req.sl       = sl;
+               mod_req.tp       = tp;
+               mod_req.magic    = InpMagicNumber;
+               OrderSend(mod_req, mod_res);
+            }
+         }
       }
       else
       {
@@ -542,6 +596,15 @@ void ClosePosition(ulong ticket)
       (req.type == ORDER_TYPE_BUY)
       ? SymbolInfoDouble(symbol, SYMBOL_ASK)
       : SymbolInfoDouble(symbol, SYMBOL_BID);
+
+   // Fix for 4756 on close (ensures correct filling type and market execution price adjustment)
+   int closeFillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   long closeExeMode = SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE);
+   if((closeFillMode & SYMBOL_FILLING_FOK) != 0)      req.type_filling = ORDER_FILLING_FOK;
+   else if((closeFillMode & SYMBOL_FILLING_IOC) != 0) req.type_filling = ORDER_FILLING_IOC;
+   else if(closeExeMode == SYMBOL_TRADE_EXECUTION_MARKET) req.type_filling = ORDER_FILLING_FOK;
+   else                                               req.type_filling = ORDER_FILLING_RETURN;
+   if(closeExeMode == SYMBOL_TRADE_EXECUTION_MARKET)  req.price = 0;
 
    OrderSend(req, res);
 }
