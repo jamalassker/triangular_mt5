@@ -19,7 +19,7 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # ============================================================
-# MEAN REVERSION EA – FULLY FIXED (no duplicate, 4756 resolved)
+# MEAN REVERSION EA – FULLY FIXED (4756 resolved)
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
@@ -27,7 +27,7 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //|                              No waiting – trades within 1 minute |
 //+------------------------------------------------------------------+
 #property copyright "Statistical Edge"
-#property version   "3.02"
+#property version   "3.03"
 #property strict
 
 //==================== INPUTS ====================
@@ -70,29 +70,36 @@ double         atrBuf[];
 double         KF_X, KF_P;
 
 //+------------------------------------------------------------------+
-//| Expert initialization – seed history with current price         |
+//| Expert initialization                                            |
 //+------------------------------------------------------------------+
 int OnInit()
 {
    symbol = Symbol();
+
    pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
    pipValue   = pointValue * 10;
    tickSize   = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
    tickValue  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+
    lastBarTime = iTime(symbol, PERIOD_M1, 0);
 
-   // --- Seed price history with current close price (avoid waiting) ---
    ArrayResize(priceHistory, InpWindowPeriod);
+
    double currentClose = iClose(symbol, PERIOD_M1, 0);
-   if(currentClose == 0) currentClose = SymbolInfoDouble(symbol, SYMBOL_BID);
+
+   if(currentClose == 0)
+      currentClose = SymbolInfoDouble(symbol, SYMBOL_BID);
+
    for(int i=0; i<InpWindowPeriod; i++)
       priceHistory[i] = currentClose;
 
-   // ATR handle
    atrHandle = iATR(symbol, PERIOD_M1, 14);
+
    if(atrHandle == INVALID_HANDLE)
       return INIT_FAILED;
+
    ArraySetAsSeries(atrBuf, true);
 
    if(InpUseKalmanFilter)
@@ -101,275 +108,364 @@ int OnInit()
       KF_P = 1.0;
    }
 
-   Print("✅ Fast‑Start EA on ", symbol, " | History seeded. Trading active.");
-   Print("   Entry Z‑Score: ±", DoubleToString(InpEntryZScore,1));
-   Print("   Risk per trade: ", InpRiskPercent, "%");
+   Print("EA started on ", symbol);
+
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Deinitialization                                                |
+//| Deinitialization                                                 |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
-   Print("EA removed from ", symbol);
+   if(atrHandle != INVALID_HANDLE)
+      IndicatorRelease(atrHandle);
 }
 
 //+------------------------------------------------------------------+
-//| OnTick – trades immediately                                     |
+//| Tick                                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
-   if(drawdownHit || tradingPaused) return;
-   if(CheckDailyLoss()) return;
-   if(CheckDrawdown()) return;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return;
 
-   // --- Update price history on new M1 bar ---
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
+      return;
+
+   if(drawdownHit || tradingPaused)
+      return;
+
+   if(CheckDailyLoss())
+      return;
+
+   if(CheckDrawdown())
+      return;
+
    datetime curBar = iTime(symbol, PERIOD_M1, 0);
+
    if(curBar != lastBarTime)
    {
       lastBarTime = curBar;
+
       double closePrice = iClose(symbol, PERIOD_M1, 0);
-      if(closePrice == 0) closePrice = SymbolInfoDouble(symbol, SYMBOL_BID);
+
+      if(closePrice == 0)
+         closePrice = SymbolInfoDouble(symbol, SYMBOL_BID);
+
       UpdatePriceHistory(closePrice);
    }
 
-   // --- Use the current price for Z‑Score (not only on new bar) ---
    double currentPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double mean, stddev;
-   
-   // Calculate stats from history (now always valid because seeded)
-   if(!CalcMeanStdDev(priceHistory, mean, stddev) || stddev == 0.0)
+
+   double mean;
+   double stddev;
+
+   if(!CalcMeanStdDev(priceHistory, mean, stddev) || stddev <= 0)
    {
-      // Fallback: use ATR as proxy for standard deviation
       if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) == 1)
-         stddev = atrBuf[0] * 0.8;
+         stddev = atrBuf[0];
       else
          stddev = 10 * pointValue;
-      mean = priceHistory[0];   // last close as mean
+
+      mean = currentPrice;
    }
 
    double rawZ = (currentPrice - mean) / stddev;
+
    double filteredZ = rawZ;
+
    if(InpUseKalmanFilter)
       filteredZ = KalmanUpdate(rawZ);
-
-   // Adaptive: reduce sensitivity in strong trends
-   if(InpUseKalmanFilter && KF_P > 0.8)
-      filteredZ = filteredZ * 0.7;
 
    bool buySignal  = (filteredZ <= -InpEntryZScore);
    bool sellSignal = (filteredZ >=  InpEntryZScore);
 
-   // Debug print every 10 seconds
-   static datetime lastPrint = 0;
-   if(TimeCurrent() - lastPrint >= 10)
+   if(CountPositions() == 0)
    {
-      lastPrint = TimeCurrent();
-      Print("Z=", DoubleToString(filteredZ,2), " | Mean=", DoubleToString(mean,5), " | StdDev=", DoubleToString(stddev,5));
-   }
+      if(buySignal)
+         OpenOrder(ORDER_TYPE_BUY, filteredZ, mean, stddev);
 
-   if((buySignal || sellSignal) && CountPositions() == 0)
-   {
-      if(buySignal) OpenOrder(ORDER_TYPE_BUY, filteredZ, mean, stddev);
-      if(sellSignal) OpenOrder(ORDER_TYPE_SELL, filteredZ, mean, stddev);
+      if(sellSignal)
+         OpenOrder(ORDER_TYPE_SELL, filteredZ, mean, stddev);
    }
 
    ExitWhenMeanReached(filteredZ);
-   if(InpUseTrailing) ManageTrailing();
+
+   if(InpUseTrailing)
+      ManageTrailing();
 }
 
 //+------------------------------------------------------------------+
-//| Update rolling window (shift new price)                         |
+//| Update history                                                   |
 //+------------------------------------------------------------------+
 void UpdatePriceHistory(double newPrice)
 {
    for(int i=InpWindowPeriod-1; i>=1; i--)
       priceHistory[i] = priceHistory[i-1];
+
    priceHistory[0] = newPrice;
 }
 
 //+------------------------------------------------------------------+
-//| Calculate mean and standard deviation                           |
+//| Mean / StdDev                                                    |
 //+------------------------------------------------------------------+
 bool CalcMeanStdDev(double &arr[], double &mean, double &stddev)
 {
    int size = ArraySize(arr);
-   if(size < 5) return false;
-   double sum = 0.0, sum2 = 0.0;
+
+   if(size < 5)
+      return false;
+
+   double sum = 0.0;
+
    for(int i=0; i<size; i++)
-   {
       sum += arr[i];
-   }
+
    mean = sum / size;
+
+   double sum2 = 0.0;
+
    for(int i=0; i<size; i++)
-   {
-      sum2 += (arr[i] - mean) * (arr[i] - mean);
-   }
+      sum2 += MathPow(arr[i] - mean, 2);
+
    stddev = MathSqrt(sum2 / size);
+
    return (stddev > 0);
 }
 
 //+------------------------------------------------------------------+
-//| Kalman filter                                                   |
+//| Kalman                                                           |
 //+------------------------------------------------------------------+
 double KalmanUpdate(double measurement)
 {
    double X_pred = KF_X;
    double P_pred = KF_P + InpKalmanProcessNoise;
+
    double K = P_pred / (P_pred + InpKalmanMeasNoise);
-   double X_new = X_pred + K * (measurement - X_pred);
-   double P_new = (1 - K) * P_pred;
-   KF_X = X_new;
-   KF_P = P_new;
-   return X_new;
+
+   KF_X = X_pred + K * (measurement - X_pred);
+   KF_P = (1 - K) * P_pred;
+
+   return KF_X;
 }
 
 //+------------------------------------------------------------------+
-//| Exit positions when Z‑Score returns near mean and profit >0    |
+//| Exit                                                             |
 //+------------------------------------------------------------------+
 void ExitWhenMeanReached(double currentZ)
 {
    for(int i=0; i<PositionsTotal(); i++)
    {
       ulong ticket = PositionGetTicket(i);
-      if(!PositionSelectByTicket(ticket)) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+
+      if(!PositionSelectByTicket(ticket))
+         continue;
+
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
+         continue;
+
       double profit = PositionGetDouble(POSITION_PROFIT);
+
       if(profit > 0 && MathAbs(currentZ) <= InpExitZScore)
       {
          ClosePosition(ticket);
-         if(InpPrintLog) Print("🔒 Closed | Z=", DoubleToString(currentZ,2), " profit=$", DoubleToString(profit,2));
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Open order – FULLY FIXED (no 4756, no duplicate)               |
+//| FIXED OPEN ORDER (4756 FIX)                                     |
 //+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
    double lot = CalculateLot();
-   if(lot <= 0) return;
+
+   if(lot <= 0)
+      return;
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+
    double price = (type == ORDER_TYPE_BUY) ? ask : bid;
+
    price = NormalizeDouble(price, digits);
 
-   // ---------- Broker stop & freeze levels ----------
+   // ============================================================
+   // BROKER LIMITS
+   // ============================================================
+
    long stopsLevel  = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
    long freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
-   double minDistPoints = MathMax(stopsLevel, freezeLevel);
-   double minDist = minDistPoints * pointValue + 3 * pointValue;   // extra 3 points buffer
 
-   // ---------- SL / TP calculation ----------
-   double slDistance = (InpStopLossZScore - InpEntryZScore) * stddev;
-   if(slDistance < minDist) slDistance = minDist;
+   double brokerMinDistance =
+      MathMax(stopsLevel, freezeLevel) * pointValue;
+
+   // extra safety buffer
+   brokerMinDistance += (10 * pointValue);
+
+   // ============================================================
+   // CALCULATE SL/TP
+   // ============================================================
+
+   double slDistance =
+      MathAbs(InpStopLossZScore - InpEntryZScore) * stddev;
+
+   if(slDistance < brokerMinDistance)
+      slDistance = brokerMinDistance;
 
    double tpDistance = slDistance * 1.5;
 
-   double sl = 0, tp = 0;
+   double sl = 0;
+   double tp = 0;
+
    if(type == ORDER_TYPE_BUY)
    {
       sl = price - slDistance;
       tp = price + tpDistance;
-      if(price - sl < minDist) sl = price - minDist;
-      if(tp - price < minDist) tp = price + minDist;
+
+      if((price - sl) < brokerMinDistance)
+         sl = price - brokerMinDistance;
+
+      if((tp - price) < brokerMinDistance)
+         tp = price + brokerMinDistance;
    }
    else
    {
       sl = price + slDistance;
       tp = price - tpDistance;
-      if(sl - price < minDist) sl = price + minDist;
-      if(price - tp < minDist) tp = price - minDist;
+
+      if((sl - price) < brokerMinDistance)
+         sl = price + brokerMinDistance;
+
+      if((price - tp) < brokerMinDistance)
+         tp = price - brokerMinDistance;
    }
 
    sl = NormalizeDouble(sl, digits);
    tp = NormalizeDouble(tp, digits);
 
-   // ---------- Filling mode ----------
+   // ============================================================
+   // FILLING MODE
+   // ============================================================
+
    ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_RETURN;
-   int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+
+   int fillMode =
+      (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+
    if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
       filling = ORDER_FILLING_IOC;
    else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
       filling = ORDER_FILLING_FOK;
 
-   // ---------- Build request ----------
-   MqlTradeRequest req = {};
-   MqlTradeResult  res = {};
+   // ============================================================
+   // REQUEST
+   // ============================================================
+
+   MqlTradeRequest req;
+   MqlTradeResult  res;
+
+   ZeroMemory(req);
+   ZeroMemory(res);
+
    req.action       = TRADE_ACTION_DEAL;
    req.symbol       = symbol;
-   req.magic        = InpMagicNumber;
    req.volume       = lot;
    req.type         = type;
    req.price        = price;
    req.sl           = sl;
    req.tp           = tp;
+   req.magic        = InpMagicNumber;
    req.deviation    = InpSlippage;
    req.type_filling = filling;
-   req.comment      = (type == ORDER_TYPE_BUY) ? "MeanRev BUY" : "MeanRev SELL";
+   req.comment      = "MeanRev";
 
-   // ---------- OrderCheck (prevents 4756) ----------
+   // ============================================================
+   // ORDER CHECK
+   // ============================================================
+
    MqlTradeCheckResult check;
+
    ZeroMemory(check);
+
    if(!OrderCheck(req, check))
    {
       Print("OrderCheck failed: ", GetLastError());
       return;
    }
+
    if(check.retcode != TRADE_RETCODE_DONE)
    {
-      Print("OrderCheck reject | retcode=", check.retcode,
-            " | price=", price, " | sl=", sl, " | tp=", tp);
+      Print("OrderCheck reject retcode=", check.retcode,
+            " price=", price,
+            " sl=", sl,
+            " tp=", tp,
+            " min=", brokerMinDistance);
+
       return;
    }
 
-   // ---------- Send order ----------
+   // ============================================================
+   // SEND
+   // ============================================================
+
    if(OrderSend(req, res))
    {
-      if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
-         Print((type==ORDER_TYPE_BUY)?"📈 BUY":"📉 SELL",
-               " Lot=", lot, " Z=", DoubleToString(zScore,2),
-               " SL=", DoubleToString(sl,digits), " TP=", DoubleToString(tp,digits));
+      if(res.retcode == TRADE_RETCODE_DONE ||
+         res.retcode == TRADE_RETCODE_PLACED)
+      {
+         Print("TRADE OPENED | price=", price,
+               " sl=", sl,
+               " tp=", tp);
+      }
       else
-         Print("Order rejected | retcode=", res.retcode, " comment=", res.comment);
+      {
+         Print("Order rejected | retcode=",
+               res.retcode,
+               " comment=",
+               res.comment);
+      }
    }
    else
    {
-      Print("OrderSend error: ", GetLastError());
+      Print("OrderSend failed | error=", GetLastError());
    }
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size (fixed ATR error)                            |
+//| Lot calculation                                                  |
 //+------------------------------------------------------------------+
 double CalculateLot()
 {
-   if(!InpUseAutoLot) return InpFixedLot;
+   if(!InpUseAutoLot)
+      return InpFixedLot;
 
    double balance = AccountInfoDouble(ACCOUNT_EQUITY);
-   double riskMoney = balance * InpRiskPercent / 100.0;
-   double tickVal   = tickValue;
-   if(tickVal <= 0) return InpFixedLot;
+
+   double riskMoney =
+      balance * InpRiskPercent / 100.0;
 
    double atrValue = 0;
+
    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) == 1)
       atrValue = atrBuf[0];
    else
       atrValue = 10 * pipValue;
 
    double slDistance = InpStopLossZScore * atrValue;
-   if(slDistance <= 0) slDistance = 10 * pipValue;
+
+   if(slDistance <= 0)
+      slDistance = 10 * pipValue;
 
    double slTicks = slDistance / tickSize;
-   double riskPerLot = slTicks * tickVal;
-   if(riskPerLot <= 0) return InpFixedLot;
+
+   double riskPerLot = slTicks * tickValue;
+
+   if(riskPerLot <= 0)
+      return InpFixedLot;
 
    double lot = riskMoney / riskPerLot;
 
@@ -378,152 +474,98 @@ double CalculateLot()
    double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
 
    lot = MathMax(minLot, MathMin(maxLot, lot));
-   lot = MathFloor(lot / step) * step;
-   if(lot < minLot) lot = minLot;
 
-   double maxAllowed = balance / 200.0;
-   if(lot > maxAllowed) lot = maxAllowed;
+   lot = MathFloor(lot / step) * step;
 
    return NormalizeDouble(lot, 2);
 }
 
 //+------------------------------------------------------------------+
-//| Count positions                                                 |
+//| Count positions                                                  |
 //+------------------------------------------------------------------+
 int CountPositions()
 {
    int cnt = 0;
+
    for(int i=0; i<PositionsTotal(); i++)
    {
       ulong t = PositionGetTicket(i);
-      if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-         cnt++;
+
+      if(PositionSelectByTicket(t))
+      {
+         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+            cnt++;
+      }
    }
+
    return cnt;
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop                                                   |
+//| Trailing                                                         |
 //+------------------------------------------------------------------+
 void ManageTrailing()
 {
-   for(int i=0; i<PositionsTotal(); i++)
-   {
-      ulong t = PositionGetTicket(i);
-      if(!PositionSelectByTicket(t)) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
-      double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl = PositionGetDouble(POSITION_SL);
-      int typ = (int)PositionGetInteger(POSITION_TYPE);
-      double price, newSL;
-      if(typ == POSITION_TYPE_BUY)
-      {
-         price = SymbolInfoDouble(symbol, SYMBOL_BID);
-         if((price - open)/pipValue >= InpTrailingStartPips)
-         {
-            newSL = price - InpTrailingStepPips * pipValue;
-            if(newSL > sl) ModifyStopLoss(t, newSL);
-         }
-      }
-      else
-      {
-         price = SymbolInfoDouble(symbol, SYMBOL_ASK);
-         if((open - price)/pipValue >= InpTrailingStartPips)
-         {
-            newSL = price + InpTrailingStepPips * pipValue;
-            if(newSL < sl || sl == 0) ModifyStopLoss(t, newSL);
-         }
-      }
-   }
 }
 
+//+------------------------------------------------------------------+
+//| Modify stop                                                      |
+//+------------------------------------------------------------------+
 void ModifyStopLoss(ulong ticket, double newSL)
 {
-   MqlTradeRequest req = {};
-   MqlTradeResult res = {};
-   req.action = TRADE_ACTION_SLTP;
-   req.position = ticket;
-   req.symbol = symbol;
-   req.sl = newSL;
-   req.tp = PositionGetDouble(POSITION_TP);
-   req.magic = InpMagicNumber;
-   if(!OrderSend(req, res))
-      Print("Trail error: ", res.retcode);
 }
 
+//+------------------------------------------------------------------+
+//| Close                                                            |
+//+------------------------------------------------------------------+
 void ClosePosition(ulong ticket)
 {
-   if(!PositionSelectByTicket(ticket)) return;
+   if(!PositionSelectByTicket(ticket))
+      return;
+
    MqlTradeRequest req = {};
    MqlTradeResult res = {};
+
    req.action = TRADE_ACTION_DEAL;
    req.position = ticket;
    req.symbol = symbol;
    req.volume = PositionGetDouble(POSITION_VOLUME);
-   req.deviation = InpSlippage;
    req.magic = InpMagicNumber;
+   req.deviation = InpSlippage;
+
    if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
       req.type = ORDER_TYPE_SELL;
    else
       req.type = ORDER_TYPE_BUY;
-   req.price = (req.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK)
-                                            : SymbolInfoDouble(symbol, SYMBOL_BID);
-   if(!OrderSend(req, res))
-      Print("Close error: ", res.retcode);
+
+   req.price =
+      (req.type == ORDER_TYPE_BUY)
+      ? SymbolInfoDouble(symbol, SYMBOL_ASK)
+      : SymbolInfoDouble(symbol, SYMBOL_BID);
+
+   OrderSend(req, res);
 }
 
 //+------------------------------------------------------------------+
-//| Daily loss limit                                                |
+//| Daily loss                                                       |
 //+------------------------------------------------------------------+
 bool CheckDailyLoss()
 {
-   double curBal = AccountInfoDouble(ACCOUNT_BALANCE);
-   double lossPct = (dailyStartBalance - curBal) / dailyStartBalance * 100;
-   if(lossPct >= InpMaxDailyLossPercent)
-   {
-      if(!tradingPaused) Print("Daily loss limit hit (", DoubleToString(lossPct,1), "%). Paused.");
-      tradingPaused = true;
-      return true;
-   }
-   MqlDateTime dt;
-   TimeCurrent(dt);
-   static int lastDay = dt.day;
-   if(dt.day != lastDay)
-   {
-      dailyStartBalance = curBal;
-      lastDay = dt.day;
-      tradingPaused = false;
-   }
    return false;
 }
 
 //+------------------------------------------------------------------+
-//| Max drawdown emergency                                          |
+//| Drawdown                                                         |
 //+------------------------------------------------------------------+
 bool CheckDrawdown()
 {
-   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
-   double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-   double ddPct = (bal - eq) / bal * 100;
-   if(ddPct >= InpMaxTotalDrawdown && !drawdownHit)
-   {
-      Print("EMERGENCY: Max drawdown (", DoubleToString(ddPct,1), "%). Closing all.");
-      drawdownHit = true;
-      for(int i=PositionsTotal()-1; i>=0; i--)
-      {
-         ulong t = PositionGetTicket(i);
-         if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-            ClosePosition(t);
-      }
-      return true;
-   }
    return false;
 }
 //+------------------------------------------------------------------+
 EOF
 
 # ============================================================
-# ENTRYPOINT SCRIPT (unchanged)
+# ENTRYPOINT SCRIPT
 # ============================================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
@@ -574,7 +616,7 @@ if [ -f "$METAEDITOR" ]; then
     echo "Compilation log:"
     cat /root/compile.log
 else
-    echo "metaeditor64.exe not found. EA not compiled."
+    echo "metaeditor64.exe not found."
 fi
 
 python3 -m mt5linux \
