@@ -23,506 +23,226 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|           AI Adaptive Crypto Scalper FIXED VERSION               |
-//|                BTCUSD / ETHUSD Aggressive EA                     |
+//|      Institutional Crypto Scalper EA (UPGRADED VERSION)         |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.00"
+#property version "5.00"
 
-// ================= INPUTS =================
-input double RiskPercent              = 1.0;
-input double FixedLot                 = 0.01;
-input bool   UseAutoLot               = true;
+//================ INPUTS =================
+input double RiskPercent        = 1.0;
+input bool   UseAutoLot         = true;
+input double FixedLot           = 0.01;
 
-input double ProfitCloseUSD           = 0.50;
-input double EmergencyLossUSD         = -2.00;
+input int    FastEMA            = 9;
+input int    SlowEMA            = 21;
+input int    TrendEMA_M5        = 50;
 
-input int    FastEMA                  = 9;
-input int    SlowEMA                  = 21;
+input int    RSI_Period         = 14;
+input int    ATR_Period         = 14;
 
-input int    RSI_Period               = 7;
-input int    ATR_Period               = 14;
+input double ATR_SL_Mult        = 1.5;
+input double ATR_TP_Mult        = 2.0;
 
-input int    MaxSpreadPoints          = 8000;
+input int    MaxSpreadPoints    = 8000;
 
-input double VolumeMultiplier         = 0.8;
+input double MinATR             = 0.5;   // volatility filter (tune per broker)
 
-input int    MagicNumber              = 99001;
-input int    Slippage                 = 20;
+input int    MagicNumber        = 99001;
+input int    Slippage           = 20;
 
-input bool   EnableBuy                = true;
-input bool   EnableSell               = true;
+input bool   EnableBuy          = true;
+input bool   EnableSell         = true;
 
-input bool   PrintLogs                = true;
-
-// ================= GLOBALS =================
+//================ GLOBALS =================
 string symbol;
 
-int fastEMAHandle;
-int slowEMAHandle;
-int rsiHandle;
-int atrHandle;
+int fastHandle, slowHandle, rsiHandle, atrHandle, trendHandle;
 
-double fastEMA[];
-double slowEMA[];
-double rsiBuffer[];
-double atrBuffer[];
+double fastEMA[], slowEMA[], rsiBuf[], atrBuf[], trendEMA[];
 
 double pointValue;
 
 //+------------------------------------------------------------------+
-//| INIT                                                             |
-//+------------------------------------------------------------------+
 int OnInit()
 {
    symbol = Symbol();
-
    pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
 
-   fastEMAHandle = iMA(symbol, PERIOD_M1, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   fastHandle  = iMA(symbol, PERIOD_M1, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   slowHandle  = iMA(symbol, PERIOD_M1, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   rsiHandle   = iRSI(symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
+   atrHandle   = iATR(symbol, PERIOD_M1, ATR_Period);
 
-   slowEMAHandle = iMA(symbol, PERIOD_M1, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   trendHandle = iMA(symbol, PERIOD_M5, TrendEMA_M5, 0, MODE_EMA, PRICE_CLOSE);
 
-   rsiHandle = iRSI(symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
-
-   atrHandle = iATR(symbol, PERIOD_M1, ATR_Period);
-
-   if(fastEMAHandle == INVALID_HANDLE ||
-      slowEMAHandle == INVALID_HANDLE ||
-      rsiHandle == INVALID_HANDLE ||
-      atrHandle == INVALID_HANDLE)
-   {
+   if(fastHandle==INVALID_HANDLE || slowHandle==INVALID_HANDLE ||
+      rsiHandle==INVALID_HANDLE  || atrHandle==INVALID_HANDLE ||
+      trendHandle==INVALID_HANDLE)
       return INIT_FAILED;
-   }
 
-   ArraySetAsSeries(fastEMA, true);
-   ArraySetAsSeries(slowEMA, true);
-   ArraySetAsSeries(rsiBuffer, true);
-   ArraySetAsSeries(atrBuffer, true);
+   ArraySetAsSeries(fastEMA,true);
+   ArraySetAsSeries(slowEMA,true);
+   ArraySetAsSeries(rsiBuf,true);
+   ArraySetAsSeries(atrBuf,true);
+   ArraySetAsSeries(trendEMA,true);
 
-   Print("AI Adaptive Crypto Scalper FIXED Started on ", symbol);
-
+   Print("Institutional EA started");
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| DEINIT                                                           |
-//+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   IndicatorRelease(fastEMAHandle);
-   IndicatorRelease(slowEMAHandle);
+   IndicatorRelease(fastHandle);
+   IndicatorRelease(slowHandle);
    IndicatorRelease(rsiHandle);
    IndicatorRelease(atrHandle);
+   IndicatorRelease(trendHandle);
 }
 
 //+------------------------------------------------------------------+
-//| TICK                                                             |
-//+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
-      return;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
+   if(GetSpread() > MaxSpreadPoints) return;
 
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
-      return;
+   if(!Update()) return;
 
-   if(GetSpreadPoints() > MaxSpreadPoints)
-      return;
-
-   // MANUAL PROFIT / LOSS CLOSE
-   CheckProfitClose();
-
-   if(!UpdateIndicators())
-      return;
+   double atr = atrBuf[0];
+   if(atr < MinATR) return; // LOW VOLATILITY FILTER
 
    double fast = fastEMA[0];
    double slow = slowEMA[0];
+   double rsi  = rsiBuf[0];
+   double trend = trendEMA[0];
 
-   double prevFast = fastEMA[1];
-
-   double rsi = rsiBuffer[0];
-
-   double slope = fast - prevFast;
-
-   double currentVolume = iVolume(symbol, PERIOD_M1, 0);
-
-   double avgVolume = GetAverageVolume();
-
-   bool volumeStrong =
-      currentVolume >= (avgVolume * VolumeMultiplier);
+   bool upTrend   = fast > slow && slow > trend;
+   bool downTrend = fast < slow && slow < trend;
 
    bool buySignal = false;
    bool sellSignal = false;
 
-   // ================= BUY =================
+   //================ BUY =================
    if(EnableBuy)
    {
-      if(
-         (
-            fast > slow ||
-            slope > 0 ||
-            rsi > 45
-         )
-         &&
-         volumeStrong
-      )
-      {
+      if(upTrend && rsi > 50 && rsi < 70)
          buySignal = true;
-      }
    }
 
-   // ================= SELL =================
+   //================ SELL =================
    if(EnableSell)
    {
-      if(
-         (
-            fast < slow ||
-            slope < 0 ||
-            rsi < 55
-         )
-         &&
-         volumeStrong
-      )
-      {
-         sellSignal = true;
-      }
-   }
-
-   // FORCE ENTRIES
-   if(!buySignal && !sellSignal)
-   {
-      if(rsi > 50)
-         buySignal = true;
-      else
+      if(downTrend && rsi < 50 && rsi > 30)
          sellSignal = true;
    }
 
-   // MAX 1 POSITION
-   if(CountPositions() >= 1)
-      return;
+   if(CountPositions() > 0) return;
 
-   if(buySignal)
-      OpenBuy();
-
-   if(sellSignal)
-      OpenSell();
+   if(buySignal)  OpenOrder(ORDER_TYPE_BUY, atr);
+   if(sellSignal) OpenOrder(ORDER_TYPE_SELL, atr);
 }
 
 //+------------------------------------------------------------------+
-//| OPEN BUY                                                         |
-//+------------------------------------------------------------------+
-void OpenBuy()
+void OpenOrder(ENUM_ORDER_TYPE type, double atr)
 {
-   double lot = CalculateLotSize();
+   double lot = CalcLot(atr);
 
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double price = (type==ORDER_TYPE_BUY)
+                  ? SymbolInfoDouble(symbol,SYMBOL_ASK)
+                  : SymbolInfoDouble(symbol,SYMBOL_BID);
+
+   double sl,tp;
+
+   if(type==ORDER_TYPE_BUY)
+   {
+      sl = price - (atr * ATR_SL_Mult);
+      tp = price + (atr * ATR_TP_Mult);
+   }
+   else
+   {
+      sl = price + (atr * ATR_SL_Mult);
+      tp = price - (atr * ATR_TP_Mult);
+   }
 
    MqlTradeRequest req;
    MqlTradeResult res;
-
    ZeroMemory(req);
    ZeroMemory(res);
 
-   ENUM_ORDER_TYPE_FILLING filling;
+   req.action = TRADE_ACTION_DEAL;
+   req.symbol = symbol;
+   req.magic  = MagicNumber;
+   req.type   = type;
+   req.volume = lot;
+   req.price  = price;
+   req.sl     = sl;
+   req.tp     = tp;
+   req.deviation = Slippage;
 
-   int fillMode =
-      (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   OrderSend(req,res);
 
-   if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-      filling = ORDER_FILLING_IOC;
-   else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-      filling = ORDER_FILLING_FOK;
+   if(res.retcode == 10009 || res.retcode == 10008)
+      Print("TRADE OK");
    else
-      filling = ORDER_FILLING_RETURN;
-
-   req.action       = TRADE_ACTION_DEAL;
-   req.symbol       = symbol;
-   req.magic        = MagicNumber;
-   req.type         = ORDER_TYPE_BUY;
-   req.volume       = lot;
-   req.price        = ask;
-
-   // IMPORTANT FIX
-   req.sl           = 0;
-   req.tp           = 0;
-
-   req.deviation    = Slippage;
-   req.type_filling = filling;
-   req.comment      = "AI BUY";
-
-   if(OrderSend(req, res))
-   {
-      Print("BUY OPENED | Lot: ", lot);
-   }
-   else
-   {
-      Print("BUY FAILED | Retcode: ",
-            res.retcode,
-            " | Comment: ",
-            res.comment);
-   }
+      Print("TRADE FAIL: ",res.retcode);
 }
 
 //+------------------------------------------------------------------+
-//| OPEN SELL                                                        |
-//+------------------------------------------------------------------+
-void OpenSell()
+double CalcLot(double atr)
 {
-   double lot = CalculateLotSize();
+   if(!UseAutoLot) return FixedLot;
 
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = balance * RiskPercent / 100.0;
 
-   MqlTradeRequest req;
-   MqlTradeResult res;
+   double slDistance = atr * ATR_SL_Mult;
+   double tickValue = SymbolInfoDouble(symbol,SYMBOL_TRADE_TICK_VALUE);
 
-   ZeroMemory(req);
-   ZeroMemory(res);
+   if(tickValue <= 0) return FixedLot;
 
-   ENUM_ORDER_TYPE_FILLING filling;
+   double lot = riskMoney / (slDistance * 1000.0);
 
-   int fillMode =
-      (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   double minLot = SymbolInfoDouble(symbol,SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol,SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(symbol,SYMBOL_VOLUME_STEP);
 
-   if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-      filling = ORDER_FILLING_IOC;
-   else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-      filling = ORDER_FILLING_FOK;
-   else
-      filling = ORDER_FILLING_RETURN;
+   lot = MathMax(minLot, MathMin(maxLot, lot));
+   lot = MathFloor(lot/step)*step;
 
-   req.action       = TRADE_ACTION_DEAL;
-   req.symbol       = symbol;
-   req.magic        = MagicNumber;
-   req.type         = ORDER_TYPE_SELL;
-   req.volume       = lot;
-   req.price        = bid;
-
-   // IMPORTANT FIX
-   req.sl           = 0;
-   req.tp           = 0;
-
-   req.deviation    = Slippage;
-   req.type_filling = filling;
-   req.comment      = "AI SELL";
-
-   if(OrderSend(req, res))
-   {
-      Print("SELL OPENED | Lot: ", lot);
-   }
-   else
-   {
-      Print("SELL FAILED | Retcode: ",
-            res.retcode,
-            " | Comment: ",
-            res.comment);
-   }
+   return NormalizeDouble(lot,2);
 }
 
 //+------------------------------------------------------------------+
-//| MANUAL PROFIT CLOSE                                              |
-//+------------------------------------------------------------------+
-void CheckProfitClose()
+bool Update()
 {
-   for(int i = PositionsTotal()-1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
-         continue;
-
-      if(PositionGetString(POSITION_SYMBOL) != symbol)
-         continue;
-
-      double profit =
-         PositionGetDouble(POSITION_PROFIT);
-
-      // TAKE PROFIT
-      if(profit >= ProfitCloseUSD)
-      {
-         ClosePosition(ticket);
-
-         Print("PROFIT CLOSED: ", profit);
-      }
-
-      // EMERGENCY STOP LOSS
-      if(profit <= EmergencyLossUSD)
-      {
-         ClosePosition(ticket);
-
-         Print("LOSS CLOSED: ", profit);
-      }
-   }
+   return CopyBuffer(fastHandle,0,0,3,fastEMA) >= 3 &&
+          CopyBuffer(slowHandle,0,0,3,slowEMA) >= 3 &&
+          CopyBuffer(rsiHandle,0,0,3,rsiBuf) >= 3 &&
+          CopyBuffer(atrHandle,0,0,3,atrBuf) >= 3 &&
+          CopyBuffer(trendHandle,0,0,3,trendEMA) >= 3;
 }
 
 //+------------------------------------------------------------------+
-//| CLOSE POSITION                                                   |
-//+------------------------------------------------------------------+
-void ClosePosition(ulong ticket)
+int GetSpread()
 {
-   if(!PositionSelectByTicket(ticket))
-      return;
-
-   ENUM_POSITION_TYPE type =
-      (ENUM_POSITION_TYPE)
-      PositionGetInteger(POSITION_TYPE);
-
-   MqlTradeRequest req;
-   MqlTradeResult res;
-
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   ENUM_ORDER_TYPE_FILLING filling;
-
-   int fillMode =
-      (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-
-   if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-      filling = ORDER_FILLING_IOC;
-   else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-      filling = ORDER_FILLING_FOK;
-   else
-      filling = ORDER_FILLING_RETURN;
-
-   req.action       = TRADE_ACTION_DEAL;
-   req.position     = ticket;
-   req.symbol       = symbol;
-   req.volume       = PositionGetDouble(POSITION_VOLUME);
-   req.magic        = MagicNumber;
-   req.deviation    = Slippage;
-   req.type_filling = filling;
-
-   if(type == POSITION_TYPE_BUY)
-   {
-      req.type  = ORDER_TYPE_SELL;
-      req.price = SymbolInfoDouble(symbol, SYMBOL_BID);
-   }
-   else
-   {
-      req.type  = ORDER_TYPE_BUY;
-      req.price = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   }
-
-   if(!OrderSend(req, res))
-   {
-      Print("CLOSE FAILED: ", res.retcode);
-   }
+   double ask = SymbolInfoDouble(symbol,SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol,SYMBOL_BID);
+   return (int)((ask-bid)/pointValue);
 }
 
-//+------------------------------------------------------------------+
-//| LOT SIZE                                                         |
-//+------------------------------------------------------------------+
-double CalculateLotSize()
-{
-   if(!UseAutoLot)
-      return FixedLot;
-
-   double balance =
-      AccountInfoDouble(ACCOUNT_BALANCE);
-
-   double riskMoney =
-      balance * RiskPercent / 100.0;
-
-   double tickValue =
-      SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-
-   if(tickValue <= 0)
-      return FixedLot;
-
-   double lot = riskMoney / 1000.0;
-
-   double minLot =
-      SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
-
-   double maxLot =
-      SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
-
-   double step =
-      SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-
-   lot = MathFloor(lot / step) * step;
-
-   if(lot < minLot)
-      lot = minLot;
-
-   if(lot > maxLot)
-      lot = maxLot;
-
-   return NormalizeDouble(lot, 2);
-}
-
-//+------------------------------------------------------------------+
-//| UPDATE INDICATORS                                                |
-//+------------------------------------------------------------------+
-bool UpdateIndicators()
-{
-   if(CopyBuffer(fastEMAHandle, 0, 0, 3, fastEMA) < 3)
-      return false;
-
-   if(CopyBuffer(slowEMAHandle, 0, 0, 3, slowEMA) < 3)
-      return false;
-
-   if(CopyBuffer(rsiHandle, 0, 0, 3, rsiBuffer) < 3)
-      return false;
-
-   if(CopyBuffer(atrHandle, 0, 0, 3, atrBuffer) < 3)
-      return false;
-
-   return true;
-}
-
-//+------------------------------------------------------------------+
-//| COUNT POSITIONS                                                  |
 //+------------------------------------------------------------------+
 int CountPositions()
 {
-   int count = 0;
-
-   for(int i=PositionsTotal()-1; i>=0; i--)
+   int c=0;
+   for(int i=0;i<PositionsTotal();i++)
    {
       ulong ticket = PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
-         PositionGetString(POSITION_SYMBOL) == symbol)
-      {
-         count++;
-      }
+      if(PositionSelectByTicket(ticket))
+         if(PositionGetInteger(POSITION_MAGIC)==MagicNumber)
+            c++;
    }
-
-   return count;
+   return c;
 }
-
-//+------------------------------------------------------------------+
-//| SPREAD                                                           |
-//+------------------------------------------------------------------+
-int GetSpreadPoints()
-{
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-
-   return (int)((ask - bid) / pointValue);
-}
-
-//+------------------------------------------------------------------+
-//| AVERAGE VOLUME                                                   |
-//+------------------------------------------------------------------+
-double GetAverageVolume()
-{
-   double total = 0;
-
-   for(int i=1; i<=20; i++)
-      total += iVolume(symbol, PERIOD_M1, i);
-
-   return total / 20.0;
-}
-//+------------------------------------------------------------------+
 EOF
 # ============================================================
 # ENTRYPOINT SCRIPT
