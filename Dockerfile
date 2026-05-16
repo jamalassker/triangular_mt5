@@ -362,7 +362,24 @@ double CalculateLot()
    if(tickVal <= 0) return InpFixedLot;
 
    // use fixed SL distance of 10 pips for risk calculation
-   double slDistance = InpStopLossZScore * (iATR(symbol, PERIOD_M1, 14)[0]);
+   // 1. Get the handle for the ATR indicator (do this once, usually in OnInit)
+int atrHandle = iATR(symbol, PERIOD_M1, 14);
+
+// 2. Create a dynamic array to hold the ATR values
+double atrValues[];
+
+// 3. Copy the most recent value (1 element from index 0) into your array
+if(CopyBuffer(atrHandle, 0, 0, 1, atrValues) > 0)
+{
+    // 4. Calculate your stop loss distance using the copied value
+    double slDistance = InpStopLossZScore * atrValues[0];
+    double slDistance = InpStopLossZScore * (iATR(symbol, PERIOD_M1, 14)[0]);
+    // Use slDistance here...
+}
+else
+{
+    Print("Failed to copy ATR data. Error code: ", GetLastError());
+}
    if(slDistance <= 0) slDistance = 10 * pipValue;
 
    double slTicks = slDistance / tickSize;
