@@ -23,11 +23,11 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                         MeanReversion_ZScore.mq5 |
-//|                      Fixed ATR array error & improved lot calc   |
+//|                                         MeanReversion_FastStart  |
+//|                              No waiting – trades within 1 minute |
 //+------------------------------------------------------------------+
 #property copyright "Statistical Edge"
-#property version   "2.10"
+#property version   "3.00"
 #property strict
 
 //==================== INPUTS ====================
@@ -70,7 +70,7 @@ double         atrBuf[];
 double         KF_X, KF_P;
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                           |
+//| Expert initialization – seed history with current price         |
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -82,16 +82,17 @@ int OnInit()
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    lastBarTime = iTime(symbol, PERIOD_M1, 0);
 
+   // --- Seed price history with current close price (avoid waiting) ---
    ArrayResize(priceHistory, InpWindowPeriod);
-   ArrayInitialize(priceHistory, 0.0);
+   double currentClose = iClose(symbol, PERIOD_M1, 0);
+   if(currentClose == 0) currentClose = SymbolInfoDouble(symbol, SYMBOL_BID);
+   for(int i=0; i<InpWindowPeriod; i++)
+      priceHistory[i] = currentClose;   // fill entire window with same price
 
    // ATR handle
    atrHandle = iATR(symbol, PERIOD_M1, 14);
    if(atrHandle == INVALID_HANDLE)
-   {
-      Print("Failed to create ATR handle");
       return INIT_FAILED;
-   }
    ArraySetAsSeries(atrBuf, true);
 
    if(InpUseKalmanFilter)
@@ -100,8 +101,8 @@ int OnInit()
       KF_P = 1.0;
    }
 
-   Print("✅ Mean Reversion EA started on ", symbol);
-   Print("   Entry Z‑Score threshold: ±", DoubleToString(InpEntryZScore,1));
+   Print("✅ Fast‑Start EA on ", symbol, " | History seeded. Trading active.");
+   Print("   Entry Z‑Score: ±", DoubleToString(InpEntryZScore,1));
    Print("   Risk per trade: ", InpRiskPercent, "%");
    return INIT_SUCCEEDED;
 }
@@ -112,11 +113,11 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
-   Print("📉 EA removed from ", symbol);
+   Print("EA removed from ", symbol);
 }
 
 //+------------------------------------------------------------------+
-//| OnTick                                                          |
+//| OnTick – trades immediately                                     |
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -126,45 +127,49 @@ void OnTick()
    if(CheckDailyLoss()) return;
    if(CheckDrawdown()) return;
 
+   // --- Update price history on new M1 bar ---
    datetime curBar = iTime(symbol, PERIOD_M1, 0);
-   if(curBar == lastBarTime) return;
-   lastBarTime = curBar;
-
-   double closePrice = iClose(symbol, PERIOD_M1, 0);
-   UpdatePriceHistory(closePrice);
-
-   int validBars = 0;
-   for(int i=0; i<InpWindowPeriod; i++)
-      if(priceHistory[i] != 0.0) validBars++;
-
-   if(validBars < 20)
+   if(curBar != lastBarTime)
    {
-      if(InpPrintLog && (TimeCurrent() % 60 == 0))
-         Print("⌛ Collecting history... ", validBars, "/", InpWindowPeriod);
-      return;
+      lastBarTime = curBar;
+      double closePrice = iClose(symbol, PERIOD_M1, 0);
+      if(closePrice == 0) closePrice = SymbolInfoDouble(symbol, SYMBOL_BID);
+      UpdatePriceHistory(closePrice);
    }
 
+   // --- Use the current price for Z‑Score (not only on new bar) ---
+   double currentPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
    double mean, stddev;
+   
+   // Calculate stats from history (now always valid because seeded)
    if(!CalcMeanStdDev(priceHistory, mean, stddev) || stddev == 0.0)
-      return;
+   {
+      // Fallback: use ATR as proxy for standard deviation
+      if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) == 1)
+         stddev = atrBuf[0] * 0.8;
+      else
+         stddev = 10 * pointValue;
+      mean = priceHistory[0];   // last close as mean
+   }
 
-   double currentPrice = priceHistory[0];
    double rawZ = (currentPrice - mean) / stddev;
    double filteredZ = rawZ;
    if(InpUseKalmanFilter)
       filteredZ = KalmanUpdate(rawZ);
 
+   // Adaptive: reduce sensitivity in strong trends
    if(InpUseKalmanFilter && KF_P > 0.8)
       filteredZ = filteredZ * 0.7;
 
    bool buySignal  = (filteredZ <= -InpEntryZScore);
    bool sellSignal = (filteredZ >=  InpEntryZScore);
 
+   // Debug print every 10 seconds
    static datetime lastPrint = 0;
-   if(TimeCurrent() - lastPrint >= 60)
+   if(TimeCurrent() - lastPrint >= 10)
    {
       lastPrint = TimeCurrent();
-      Print("Z: ", DoubleToString(filteredZ,3), " | Mean: ", DoubleToString(mean,5), " | StdDev: ", DoubleToString(stddev,5));
+      Print("Z=", DoubleToString(filteredZ,2), " | Mean=", DoubleToString(mean,5), " | StdDev=", DoubleToString(stddev,5));
    }
 
    if((buySignal || sellSignal) && CountPositions() == 0)
@@ -178,7 +183,7 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
-//| Update rolling window                                           |
+//| Update rolling window (shift new price)                         |
 //+------------------------------------------------------------------+
 void UpdatePriceHistory(double newPrice)
 {
@@ -188,23 +193,24 @@ void UpdatePriceHistory(double newPrice)
 }
 
 //+------------------------------------------------------------------+
-//| Calculate mean and stddev                                       |
+//| Calculate mean and standard deviation                           |
 //+------------------------------------------------------------------+
 bool CalcMeanStdDev(double &arr[], double &mean, double &stddev)
 {
    int size = ArraySize(arr);
-   if(size < 10) return false;
+   if(size < 5) return false;   // reduced from 10 to 5
    double sum = 0.0, sum2 = 0.0;
-   int cnt = 0;
    for(int i=0; i<size; i++)
-      if(arr[i] != 0.0) { sum += arr[i]; cnt++; }
-   if(cnt < 10) return false;
-   mean = sum / cnt;
+   {
+      sum += arr[i];
+   }
+   mean = sum / size;
    for(int i=0; i<size; i++)
-      if(arr[i] != 0.0)
-         sum2 += (arr[i] - mean) * (arr[i] - mean);
-   stddev = MathSqrt(sum2 / cnt);
-   return true;
+   {
+      sum2 += (arr[i] - mean) * (arr[i] - mean);
+   }
+   stddev = MathSqrt(sum2 / size);
+   return (stddev > 0);
 }
 
 //+------------------------------------------------------------------+
@@ -223,7 +229,7 @@ double KalmanUpdate(double measurement)
 }
 
 //+------------------------------------------------------------------+
-//| Exit positions                                                  |
+//| Exit positions when Z‑Score returns near mean and profit >0    |
 //+------------------------------------------------------------------+
 void ExitWhenMeanReached(double currentZ)
 {
@@ -236,13 +242,13 @@ void ExitWhenMeanReached(double currentZ)
       if(profit > 0 && MathAbs(currentZ) <= InpExitZScore)
       {
          ClosePosition(ticket);
-         if(InpPrintLog) Print("🔒 Closed profitable | Z=", DoubleToString(currentZ,3), " profit=$", DoubleToString(profit,2));
+         if(InpPrintLog) Print("🔒 Closed | Z=", DoubleToString(currentZ,2), " profit=$", DoubleToString(profit,2));
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Open order                                                      |
+//| Open order (unchanged)                                          |
 //+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
@@ -305,16 +311,16 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
    if(OrderSend(req, res))
    {
       if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
-         Print((type == ORDER_TYPE_BUY)?"📈 BUY":"📉 SELL", " opened | Lot=", lot, " | Z=", DoubleToString(zScore,2));
+         Print((type==ORDER_TYPE_BUY)?"📈 BUY":"📉 SELL", " Lot=", lot, " Z=", DoubleToString(zScore,2));
       else
-         Print("Order rejected | retcode=", res.retcode);
+         Print("Order reject | retcode=", res.retcode);
    }
    else
       Print("OrderSend error: ", GetLastError());
 }
 
 //+------------------------------------------------------------------+
-//| Calculate lot size – FIXED ATR ARRAY ERROR                      |
+//| Calculate lot size (fixed ATR error)                            |
 //+------------------------------------------------------------------+
 double CalculateLot()
 {
@@ -325,12 +331,11 @@ double CalculateLot()
    double tickVal   = tickValue;
    if(tickVal <= 0) return InpFixedLot;
 
-   // --- Get current ATR value safely ---
    double atrValue = 0;
    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) == 1)
       atrValue = atrBuf[0];
    else
-      atrValue = 10 * pipValue;   // fallback
+      atrValue = 10 * pipValue;
 
    double slDistance = InpStopLossZScore * atrValue;
    if(slDistance <= 0) slDistance = 10 * pipValue;
@@ -371,7 +376,7 @@ int CountPositions()
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop                                                   |
+//| Trailing stop (unchanged)                                       |
 //+------------------------------------------------------------------+
 void ManageTrailing()
 {
@@ -416,7 +421,7 @@ void ModifyStopLoss(ulong ticket, double newSL)
    req.tp = PositionGetDouble(POSITION_TP);
    req.magic = InpMagicNumber;
    if(!OrderSend(req, res))
-      Print("Trail modify error: ", res.retcode);
+      Print("Trail error: ", res.retcode);
 }
 
 void ClosePosition(ulong ticket)
@@ -446,8 +451,7 @@ bool CheckDailyLoss()
    double lossPct = (dailyStartBalance - curBal) / dailyStartBalance * 100;
    if(lossPct >= InpMaxDailyLossPercent)
    {
-      if(!tradingPaused)
-         Print("Daily loss limit hit (", DoubleToString(lossPct,1), "%). Trading paused.");
+      if(!tradingPaused) Print("Daily loss limit hit (", DoubleToString(lossPct,1), "%). Paused.");
       tradingPaused = true;
       return true;
    }
@@ -470,7 +474,7 @@ bool CheckDrawdown()
    double ddPct = (bal - eq) / bal * 100;
    if(ddPct >= InpMaxTotalDrawdown && !drawdownHit)
    {
-      Print("EMERGENCY: Max drawdown reached (", DoubleToString(ddPct,1), "%). Closing all.");
+      Print("EMERGENCY: Max drawdown (", DoubleToString(ddPct,1), "%). Closing all.");
       drawdownHit = true;
       for(int i=PositionsTotal()-1; i>=0; i--)
       {
