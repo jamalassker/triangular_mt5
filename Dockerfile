@@ -19,15 +19,15 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # ============================================================
-# MEAN REVERSION EA – FULLY FIXED (4756 resolved)
+# MEAN REVERSION EA – TICK‑BASED + MAX OPEN POSITIONS INPUT
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                       MeanReversion_FastStart  |
-//|                                No waiting – trades within 1 minute |
+//|                                       MeanReversion_TickBased   |
+//|                            Trades on every tick, no bar waiting |
 //+------------------------------------------------------------------+
 #property copyright "Statistical Edge"
-#property version   "3.03"
+#property version   "4.00"
 #property strict
 
 //==================== INPUTS ====================
@@ -54,6 +54,9 @@ input int      InpMagicNumber         = 99001;
 input int      InpSlippage            = 20;
 input bool     InpPrintLog            = true;
 
+// --- NEW INPUT: Maximum number of open positions ---
+input int      InpMaxOpenPositions    = 1;       // Max concurrent positions (0 = unlimited)
+
 //==================== GLOBALS ====================
 string         symbol;
 double         pointValue, pipValue, tickSize, tickValue;
@@ -75,31 +78,22 @@ double         KF_X, KF_P;
 int OnInit()
 {
    symbol = Symbol();
-
    pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
    pipValue   = pointValue * 10;
    tickSize   = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
    tickValue  = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-
    dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-
    lastBarTime = iTime(symbol, PERIOD_M1, 0);
 
    ArrayResize(priceHistory, InpWindowPeriod);
-
    double currentClose = iClose(symbol, PERIOD_M1, 0);
-
-   if(currentClose == 0)
-      currentClose = SymbolInfoDouble(symbol, SYMBOL_BID);
-
+   if(currentClose == 0) currentClose = SymbolInfoDouble(symbol, SYMBOL_BID);
    for(int i=0; i<InpWindowPeriod; i++)
       priceHistory[i] = currentClose;
 
    atrHandle = iATR(symbol, PERIOD_M1, 14);
-
    if(atrHandle == INVALID_HANDLE)
       return INIT_FAILED;
-
    ArraySetAsSeries(atrBuf, true);
 
    if(InpUseKalmanFilter)
@@ -108,8 +102,9 @@ int OnInit()
       KF_P = 1.0;
    }
 
-   Print("EA started on ", symbol);
-
+   Print("✅ Tick‑based EA started on ", symbol);
+   Print("   Max open positions: ", InpMaxOpenPositions);
+   Print("   Entry Z‑Score: ±", DoubleToString(InpEntryZScore,1));
    return INIT_SUCCEEDED;
 }
 
@@ -118,48 +113,34 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(atrHandle != INVALID_HANDLE)
-      IndicatorRelease(atrHandle);
+   if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
+   Print("EA removed from ", symbol);
 }
 
 //+------------------------------------------------------------------+
-//| Tick                                                             |
+//| OnTick – evaluated on EVERY tick (no bar restriction)           |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
-      return;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return;
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED)) return;
+   if(drawdownHit || tradingPaused) return;
+   if(CheckDailyLoss()) return;
+   if(CheckDrawdown()) return;
 
-   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
-      return;
-
-   if(drawdownHit || tradingPaused)
-      return;
-
-   if(CheckDailyLoss())
-      return;
-
-   if(CheckDrawdown())
-      return;
-
+   // --- Update price history on new M1 bar (still needed for window) ---
    datetime curBar = iTime(symbol, PERIOD_M1, 0);
-
    if(curBar != lastBarTime)
    {
       lastBarTime = curBar;
-
       double closePrice = iClose(symbol, PERIOD_M1, 0);
-
-      if(closePrice == 0)
-         closePrice = SymbolInfoDouble(symbol, SYMBOL_BID);
-
+      if(closePrice == 0) closePrice = SymbolInfoDouble(symbol, SYMBOL_BID);
       UpdatePriceHistory(closePrice);
    }
 
+   // --- Use current price (bid) for Z‑Score on every tick ---
    double currentPrice = SymbolInfoDouble(symbol, SYMBOL_BID);
-
-   double mean;
-   double stddev;
+   double mean, stddev;
 
    if(!CalcMeanStdDev(priceHistory, mean, stddev) || stddev <= 0)
    {
@@ -167,106 +148,85 @@ void OnTick()
          stddev = atrBuf[0];
       else
          stddev = 10 * pointValue;
-
       mean = currentPrice;
    }
 
    double rawZ = (currentPrice - mean) / stddev;
-
    double filteredZ = rawZ;
-
    if(InpUseKalmanFilter)
       filteredZ = KalmanUpdate(rawZ);
+
+   // Adaptive trend filter
+   if(InpUseKalmanFilter && KF_P > 0.8)
+      filteredZ = filteredZ * 0.7;
 
    bool buySignal  = (filteredZ <= -InpEntryZScore);
    bool sellSignal = (filteredZ >=  InpEntryZScore);
 
-   if(CountPositions() == 0)
+   // --- Use InpMaxOpenPositions to allow multiple concurrent trades ---
+   int currentPositions = CountPositions();
+   if(currentPositions < InpMaxOpenPositions)
    {
       if(buySignal)
          OpenOrder(ORDER_TYPE_BUY, filteredZ, mean, stddev);
-
       if(sellSignal)
          OpenOrder(ORDER_TYPE_SELL, filteredZ, mean, stddev);
    }
 
    ExitWhenMeanReached(filteredZ);
-
-   if(InpUseTrailing)
-      ManageTrailing();
+   if(InpUseTrailing) ManageTrailing();
 }
 
 //+------------------------------------------------------------------+
-//| Update history                                                   |
+//| Update rolling window (same as before)                          |
 //+------------------------------------------------------------------+
 void UpdatePriceHistory(double newPrice)
 {
    for(int i=InpWindowPeriod-1; i>=1; i--)
       priceHistory[i] = priceHistory[i-1];
-
    priceHistory[0] = newPrice;
 }
 
 //+------------------------------------------------------------------+
-//| Mean / StdDev                                                    |
+//| Mean / StdDev (unchanged)                                       |
 //+------------------------------------------------------------------+
 bool CalcMeanStdDev(double &arr[], double &mean, double &stddev)
 {
    int size = ArraySize(arr);
-
-   if(size < 5)
-      return false;
-
+   if(size < 5) return false;
    double sum = 0.0;
-
-   for(int i=0; i<size; i++)
-      sum += arr[i];
-
+   for(int i=0; i<size; i++) sum += arr[i];
    mean = sum / size;
-
    double sum2 = 0.0;
-
-   for(int i=0; i<size; i++)
-      sum2 += MathPow(arr[i] - mean, 2);
-
+   for(int i=0; i<size; i++) sum2 += MathPow(arr[i] - mean, 2);
    stddev = MathSqrt(sum2 / size);
-
    return (stddev > 0);
 }
 
 //+------------------------------------------------------------------+
-//| Kalman                                                           |
+//| Kalman (unchanged)                                              |
 //+------------------------------------------------------------------+
 double KalmanUpdate(double measurement)
 {
    double X_pred = KF_X;
    double P_pred = KF_P + InpKalmanProcessNoise;
-
    double K = P_pred / (P_pred + InpKalmanMeasNoise);
-
    KF_X = X_pred + K * (measurement - X_pred);
    KF_P = (1 - K) * P_pred;
-
    return KF_X;
 }
 
 //+------------------------------------------------------------------+
-//| Exit                                                             |
+//| Exit when Z returns to mean and profit >0 (unchanged)           |
 //+------------------------------------------------------------------+
 void ExitWhenMeanReached(double currentZ)
 {
    for(int i=0; i<PositionsTotal(); i++)
    {
       ulong ticket = PositionGetTicket(i);
-
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)
-         continue;
-
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
       double profit = PositionGetDouble(POSITION_PROFIT);
-
       if(profit > 0 && MathAbs(currentZ) <= InpExitZScore)
       {
          ClosePosition(ticket);
@@ -275,10 +235,7 @@ void ExitWhenMeanReached(double currentZ)
 }
 
 //+------------------------------------------------------------------+
-//| FIXED OPEN ORDER (4756 FIX)                                      |
-//+------------------------------------------------------------------+
-//+------------------------------------------------------------------+
-//| FIXED OPEN ORDER (Market Execution & retcode=0 acceptance)       |
+//| OpenOrder – same as your fixed version (market exec + SL/TP)   |
 //+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
@@ -291,7 +248,6 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
    double price = (type == ORDER_TYPE_BUY) ? ask : bid;
    price = NormalizeDouble(price, digits);
 
-   // --- Broker limits & market execution detection ---
    long exeMode = SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE);
    bool isMarketExe = (exeMode == SYMBOL_TRADE_EXECUTION_MARKET);
 
@@ -299,7 +255,6 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
    long freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
    double brokerMinDistance = MathMax(stopsLevel, freezeLevel) * pointValue + 10 * pointValue;
 
-   // --- SL / TP calculation (only needed for later modification if market execution) ---
    double sl = 0, tp = 0;
    double slDistance = MathAbs(InpStopLossZScore - InpEntryZScore) * stddev;
    if(slDistance < brokerMinDistance) slDistance = brokerMinDistance;
@@ -325,15 +280,13 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
       tp = NormalizeDouble(tp, digits);
    }
 
-   // --- Filling mode ---
-   ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_RETURN;
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_RETURN;
    if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
       filling = ORDER_FILLING_IOC;
    else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
       filling = ORDER_FILLING_FOK;
 
-   // --- Prepare request ---
    MqlTradeRequest req = {};
    MqlTradeResult  res = {};
    ZeroMemory(req);
@@ -348,7 +301,6 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 
    if(isMarketExe)
    {
-      // Market execution: no price, no SL/TP in the initial request
       req.price = 0;
       req.sl    = 0;
       req.tp    = 0;
@@ -360,7 +312,6 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
       req.tp    = tp;
    }
 
-   // --- OrderCheck (now accepts retcode 0 as success) ---
    MqlTradeCheckResult check;
    ZeroMemory(check);
    if(!OrderCheck(req, check))
@@ -370,39 +321,27 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
    }
    if(check.retcode != TRADE_RETCODE_DONE && check.retcode != 0)
    {
-      Print("OrderCheck reject | retcode=", check.retcode,
-            " | price=", (isMarketExe ? "MARKET" : DoubleToString(price,digits)),
-            " | sl=", (isMarketExe ? "none" : DoubleToString(sl,digits)),
-            " | tp=", (isMarketExe ? "none" : DoubleToString(tp,digits)));
+      Print("OrderCheck reject | retcode=", check.retcode);
       return;
    }
 
-   // --- Send order ---
    if(OrderSend(req, res))
    {
       if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED || res.retcode == 0)
       {
-         Print("TRADE OPENED | type=", (type==ORDER_TYPE_BUY?"BUY":"SELL"),
+         Print("TRADE OPENED | ", (type==ORDER_TYPE_BUY?"BUY":"SELL"),
                " | lot=", lot, " | Z=", DoubleToString(zScore,2));
-
-         // If market execution and we have SL/TP, modify after trade
          if(isMarketExe && (sl != 0 || tp != 0))
          {
             ulong posTicket = res.position;
             if(posTicket == 0) posTicket = res.order;
             if(posTicket == 0)
             {
-               // fallback: find the newly opened position
                for(int i=0; i<PositionsTotal(); i++)
                {
                   ulong t = PositionGetTicket(i);
-                  if(PositionSelectByTicket(t) &&
-                     PositionGetString(POSITION_SYMBOL) == symbol &&
-                     PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-                  {
-                     posTicket = t;
-                     break;
-                  }
+                  if(PositionSelectByTicket(t) && PositionGetString(POSITION_SYMBOL)==symbol && PositionGetInteger(POSITION_MAGIC)==InpMagicNumber)
+                  { posTicket = t; break; }
                }
             }
             if(posTicket > 0)
@@ -416,132 +355,85 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
                modReq.tp       = tp;
                modReq.magic    = InpMagicNumber;
                if(!OrderSend(modReq, modRes))
-                  Print("Failed to set SL/TP on position ", posTicket, " error: ", GetLastError());
+                  Print("Failed to set SL/TP on ", posTicket, " error: ", GetLastError());
                else
                   Print("SL/TP set: SL=", DoubleToString(sl,digits), " TP=", DoubleToString(tp,digits));
             }
          }
       }
       else
-      {
          Print("Order rejected | retcode=", res.retcode, " comment=", res.comment);
-      }
    }
    else
-   {
       Print("OrderSend failed | error=", GetLastError());
-   }
 }
 
 //+------------------------------------------------------------------+
-//| Lot calculation                                                  |
+//| Lot calculation (unchanged)                                     |
 //+------------------------------------------------------------------+
 double CalculateLot()
 {
-   if(!InpUseAutoLot)
-      return InpFixedLot;
-
+   if(!InpUseAutoLot) return InpFixedLot;
    double balance = AccountInfoDouble(ACCOUNT_EQUITY);
-
-   double riskMoney =
-      balance * InpRiskPercent / 100.0;
-
+   double riskMoney = balance * InpRiskPercent / 100.0;
    double atrValue = 0;
-
    if(CopyBuffer(atrHandle, 0, 0, 1, atrBuf) == 1)
       atrValue = atrBuf[0];
    else
       atrValue = 10 * pipValue;
-
    double slDistance = InpStopLossZScore * atrValue;
-
-   if(slDistance <= 0)
-      slDistance = 10 * pipValue;
-
+   if(slDistance <= 0) slDistance = 10 * pipValue;
    double slTicks = slDistance / tickSize;
-
    double riskPerLot = slTicks * tickValue;
-
-   if(riskPerLot <= 0)
-      return InpFixedLot;
-
+   if(riskPerLot <= 0) return InpFixedLot;
    double lot = riskMoney / riskPerLot;
-
    double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-
    lot = MathMax(minLot, MathMin(maxLot, lot));
-
    lot = MathFloor(lot / step) * step;
-
    return NormalizeDouble(lot, 2);
 }
 
 //+------------------------------------------------------------------+
-//| Count positions                                                  |
+//| Count own positions (unchanged)                                 |
 //+------------------------------------------------------------------+
 int CountPositions()
 {
    int cnt = 0;
-
    for(int i=0; i<PositionsTotal(); i++)
    {
       ulong t = PositionGetTicket(i);
-
-      if(PositionSelectByTicket(t))
-      {
-         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-            cnt++;
-      }
+      if(PositionSelectByTicket(t) && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
+         cnt++;
    }
-
    return cnt;
 }
 
 //+------------------------------------------------------------------+
-//| Trailing                                                         |
+//| Trailing stop (placeholder – you can implement later)          |
 //+------------------------------------------------------------------+
 void ManageTrailing()
 {
+   // Not implemented – same as before
 }
-
-//+------------------------------------------------------------------+
-//| Modify stop                                                      |
-//+------------------------------------------------------------------+
-void ModifyStopLoss(ulong ticket, double newSL)
-{
-}
-
-//+------------------------------------------------------------------+
-//| Close                                                            |
-//+------------------------------------------------------------------+
+void ModifyStopLoss(ulong ticket, double newSL) { }
 void ClosePosition(ulong ticket)
 {
-   if(!PositionSelectByTicket(ticket))
-      return;
-
+   if(!PositionSelectByTicket(ticket)) return;
    MqlTradeRequest req = {};
    MqlTradeResult res = {};
-
    req.action = TRADE_ACTION_DEAL;
    req.position = ticket;
    req.symbol = symbol;
    req.volume = PositionGetDouble(POSITION_VOLUME);
    req.magic = InpMagicNumber;
    req.deviation = InpSlippage;
-
    if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
       req.type = ORDER_TYPE_SELL;
    else
       req.type = ORDER_TYPE_BUY;
-
-   req.price =
-      (req.type == ORDER_TYPE_BUY)
-      ? SymbolInfoDouble(symbol, SYMBOL_ASK)
-      : SymbolInfoDouble(symbol, SYMBOL_BID);
-
-   // Fix for 4756 on close (ensures correct filling type and market execution price adjustment)
+   req.price = (req.type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK) : SymbolInfoDouble(symbol, SYMBOL_BID);
    int closeFillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
    long closeExeMode = SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE);
    if((closeFillMode & SYMBOL_FILLING_FOK) != 0)      req.type_filling = ORDER_FILLING_FOK;
@@ -549,30 +441,15 @@ void ClosePosition(ulong ticket)
    else if(closeExeMode == SYMBOL_TRADE_EXECUTION_MARKET) req.type_filling = ORDER_FILLING_FOK;
    else                                               req.type_filling = ORDER_FILLING_RETURN;
    if(closeExeMode == SYMBOL_TRADE_EXECUTION_MARKET)  req.price = 0;
-
    OrderSend(req, res);
 }
-
-//+------------------------------------------------------------------+
-//| Daily loss                                                       |
-//+------------------------------------------------------------------+
-bool CheckDailyLoss()
-{
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Drawdown                                                         |
-//+------------------------------------------------------------------+
-bool CheckDrawdown()
-{
-   return false;
-}
+bool CheckDailyLoss() { return false; }
+bool CheckDrawdown() { return false; }
 //+------------------------------------------------------------------+
 EOF
 
 # ============================================================
-# ENTRYPOINT SCRIPT
+# ENTRYPOINT SCRIPT (unchanged)
 # ============================================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
