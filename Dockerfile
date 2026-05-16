@@ -277,210 +277,154 @@ void ExitWhenMeanReached(double currentZ)
 //+------------------------------------------------------------------+
 //| FIXED OPEN ORDER (4756 FIX)                                      |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| FIXED OPEN ORDER (Market Execution & retcode=0 acceptance)       |
+//+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
    double lot = CalculateLot();
-
-   if(lot <= 0)
-      return;
+   if(lot <= 0) return;
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-
    double price = (type == ORDER_TYPE_BUY) ? ask : bid;
-
    price = NormalizeDouble(price, digits);
 
-   // ============================================================
-   // BROKER LIMITS
-   // ============================================================
+   // --- Broker limits & market execution detection ---
+   long exeMode = SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE);
+   bool isMarketExe = (exeMode == SYMBOL_TRADE_EXECUTION_MARKET);
 
    long stopsLevel  = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
    long freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double brokerMinDistance = MathMax(stopsLevel, freezeLevel) * pointValue + 10 * pointValue;
 
-   double brokerMinDistance =
-      MathMax(stopsLevel, freezeLevel) * pointValue;
-
-   // extra safety buffer
-   brokerMinDistance += (10 * pointValue);
-
-   // ============================================================
-   // CALCULATE SL/TP
-   // ============================================================
-
-   double slDistance =
-      MathAbs(InpStopLossZScore - InpEntryZScore) * stddev;
-
-   if(slDistance < brokerMinDistance)
-      slDistance = brokerMinDistance;
-
+   // --- SL / TP calculation (only needed for later modification if market execution) ---
+   double sl = 0, tp = 0;
+   double slDistance = MathAbs(InpStopLossZScore - InpEntryZScore) * stddev;
+   if(slDistance < brokerMinDistance) slDistance = brokerMinDistance;
    double tpDistance = slDistance * 1.5;
 
-   double sl = 0;
-   double tp = 0;
-
-   if(type == ORDER_TYPE_BUY)
+   if(!isMarketExe)
    {
-      sl = price - slDistance;
-      tp = price + tpDistance;
-
-      if((price - sl) < brokerMinDistance)
-         sl = price - brokerMinDistance;
-
-      if((tp - price) < brokerMinDistance)
-         tp = price + brokerMinDistance;
-   }
-   else
-   {
-      sl = price + slDistance;
-      tp = price - tpDistance;
-
-      if((sl - price) < brokerMinDistance)
-         sl = price + brokerMinDistance;
-
-      if((price - tp) < brokerMinDistance)
-         tp = price - brokerMinDistance;
+      if(type == ORDER_TYPE_BUY)
+      {
+         sl = price - slDistance;
+         tp = price + tpDistance;
+         if(price - sl < brokerMinDistance) sl = price - brokerMinDistance;
+         if(tp - price < brokerMinDistance) tp = price + brokerMinDistance;
+      }
+      else
+      {
+         sl = price + slDistance;
+         tp = price - tpDistance;
+         if(sl - price < brokerMinDistance) sl = price + brokerMinDistance;
+         if(price - tp < brokerMinDistance) tp = price - brokerMinDistance;
+      }
+      sl = NormalizeDouble(sl, digits);
+      tp = NormalizeDouble(tp, digits);
    }
 
-   sl = NormalizeDouble(sl, digits);
-   tp = NormalizeDouble(tp, digits);
-
-   // ============================================================
-   // FILLING MODE
-   // ============================================================
-
+   // --- Filling mode ---
    ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_RETURN;
-
-   int fillMode =
-      (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-
+   int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
    if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
       filling = ORDER_FILLING_IOC;
    else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
       filling = ORDER_FILLING_FOK;
 
-   // ============================================================
-   // REQUEST
-   // ============================================================
-
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-
+   // --- Prepare request ---
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
    ZeroMemory(req);
-   ZeroMemory(res);
-
    req.action       = TRADE_ACTION_DEAL;
    req.symbol       = symbol;
    req.volume       = lot;
    req.type         = type;
-   req.price        = price;
-   req.sl           = sl;
-   req.tp           = tp;
    req.magic        = InpMagicNumber;
    req.deviation    = InpSlippage;
    req.type_filling = filling;
    req.comment      = "MeanRev";
 
-   // ============================================================
-   // CRITICAL OVERRIDES FOR ERROR 4756 (MARKET EXECUTION & FILL MODE)
-   // ============================================================
-   long exeMode = SymbolInfoInteger(symbol, SYMBOL_TRADE_EXEMODE);
-   if(exeMode == SYMBOL_TRADE_EXECUTION_MARKET)
+   if(isMarketExe)
    {
+      // Market execution: no price, no SL/TP in the initial request
       req.price = 0;
-      req.sl = 0;
-      req.tp = 0;
+      req.sl    = 0;
+      req.tp    = 0;
    }
-   if((fillMode & SYMBOL_FILLING_FOK) != 0)          req.type_filling = ORDER_FILLING_FOK;
-   else if((fillMode & SYMBOL_FILLING_IOC) != 0)     req.type_filling = ORDER_FILLING_IOC;
-   else if(exeMode == SYMBOL_TRADE_EXECUTION_MARKET) req.type_filling = ORDER_FILLING_FOK;
-   else                                              req.type_filling = ORDER_FILLING_RETURN;
+   else
+   {
+      req.price = price;
+      req.sl    = sl;
+      req.tp    = tp;
+   }
 
-   // ============================================================
-   // ORDER CHECK
-   // ============================================================
-
+   // --- OrderCheck (now accepts retcode 0 as success) ---
    MqlTradeCheckResult check;
-
    ZeroMemory(check);
-
    if(!OrderCheck(req, check))
    {
       Print("OrderCheck failed: ", GetLastError());
       return;
    }
-
-   if(check.retcode != TRADE_RETCODE_DONE)
+   if(check.retcode != TRADE_RETCODE_DONE && check.retcode != 0)
    {
-      Print("OrderCheck reject retcode=", check.retcode,
-            " price=", price,
-            " sl=", sl,
-            " tp=", tp,
-            " min=", brokerMinDistance);
-
+      Print("OrderCheck reject | retcode=", check.retcode,
+            " | price=", (isMarketExe ? "MARKET" : DoubleToString(price,digits)),
+            " | sl=", (isMarketExe ? "none" : DoubleToString(sl,digits)),
+            " | tp=", (isMarketExe ? "none" : DoubleToString(tp,digits)));
       return;
    }
 
-   // ============================================================
-   // SEND
-   // ============================================================
-
+   // --- Send order ---
    if(OrderSend(req, res))
    {
-      if(res.retcode == TRADE_RETCODE_DONE ||
-         res.retcode == TRADE_RETCODE_PLACED)
+      if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED || res.retcode == 0)
       {
-         Print("TRADE OPENED | price=", price,
-               " sl=", sl,
-               " tp=", tp);
+         Print("TRADE OPENED | type=", (type==ORDER_TYPE_BUY?"BUY":"SELL"),
+               " | lot=", lot, " | Z=", DoubleToString(zScore,2));
 
-         // Apply StopLoss and TakeProfit via a post-deal modification if in Market Execution mode
-         if(exeMode == SYMBOL_TRADE_EXECUTION_MARKET && (sl > 0 || tp > 0))
+         // If market execution and we have SL/TP, modify after trade
+         if(isMarketExe && (sl != 0 || tp != 0))
          {
-            ulong position_ticket = res.position;
-            if(position_ticket == 0) position_ticket = res.order;
-            if(position_ticket == 0)
+            ulong posTicket = res.position;
+            if(posTicket == 0) posTicket = res.order;
+            if(posTicket == 0)
             {
+               // fallback: find the newly opened position
                for(int i=0; i<PositionsTotal(); i++)
                {
                   ulong t = PositionGetTicket(i);
-                  if(PositionSelectByTicket(t))
+                  if(PositionSelectByTicket(t) &&
+                     PositionGetString(POSITION_SYMBOL) == symbol &&
+                     PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
                   {
-                     if(PositionGetString(POSITION_SYMBOL) == symbol && PositionGetInteger(POSITION_MAGIC) == InpMagicNumber)
-                     {
-                        if(PositionGetDouble(POSITION_SL) == 0 && PositionGetDouble(POSITION_TP) == 0)
-                        {
-                           position_ticket = t;
-                           break;
-                        }
-                     }
+                     posTicket = t;
+                     break;
                   }
                }
             }
-            if(position_ticket > 0)
+            if(posTicket > 0)
             {
-               MqlTradeRequest mod_req;
-               MqlTradeResult  mod_res;
-               ZeroMemory(mod_req);
-               ZeroMemory(mod_res);
-               mod_req.action   = TRADE_ACTION_SLTP;
-               mod_req.position = position_ticket;
-               mod_req.symbol   = symbol;
-               mod_req.sl       = sl;
-               mod_req.tp       = tp;
-               mod_req.magic    = InpMagicNumber;
-               OrderSend(mod_req, mod_res);
+               MqlTradeRequest modReq = {};
+               MqlTradeResult  modRes = {};
+               modReq.action   = TRADE_ACTION_SLTP;
+               modReq.position = posTicket;
+               modReq.symbol   = symbol;
+               modReq.sl       = sl;
+               modReq.tp       = tp;
+               modReq.magic    = InpMagicNumber;
+               if(!OrderSend(modReq, modRes))
+                  Print("Failed to set SL/TP on position ", posTicket, " error: ", GetLastError());
+               else
+                  Print("SL/TP set: SL=", DoubleToString(sl,digits), " TP=", DoubleToString(tp,digits));
             }
          }
       }
       else
       {
-         Print("Order rejected | retcode=",
-               res.retcode,
-               " comment=",
-               res.comment);
+         Print("Order rejected | retcode=", res.retcode, " comment=", res.comment);
       }
    }
    else
