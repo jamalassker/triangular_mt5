@@ -19,7 +19,7 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # ============================================================
-# AGGRESSIVE MICRO SCALPER EA – FIXED 4756 (min SL distance)
+# MEAN REVERSION EA – FULLY FIXED (no duplicate, 4756 resolved)
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
@@ -27,7 +27,7 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //|                              No waiting – trades within 1 minute |
 //+------------------------------------------------------------------+
 #property copyright "Statistical Edge"
-#property version   "3.01"
+#property version   "3.02"
 #property strict
 
 //==================== INPUTS ====================
@@ -87,7 +87,7 @@ int OnInit()
    double currentClose = iClose(symbol, PERIOD_M1, 0);
    if(currentClose == 0) currentClose = SymbolInfoDouble(symbol, SYMBOL_BID);
    for(int i=0; i<InpWindowPeriod; i++)
-      priceHistory[i] = currentClose;   // fill entire window with same price
+      priceHistory[i] = currentClose;
 
    // ATR handle
    atrHandle = iATR(symbol, PERIOD_M1, 14);
@@ -198,7 +198,7 @@ void UpdatePriceHistory(double newPrice)
 bool CalcMeanStdDev(double &arr[], double &mean, double &stddev)
 {
    int size = ArraySize(arr);
-   if(size < 5) return false;   // reduced from 10 to 5
+   if(size < 5) return false;
    double sum = 0.0, sum2 = 0.0;
    for(int i=0; i<size; i++)
    {
@@ -248,14 +248,7 @@ void ExitWhenMeanReached(double currentZ)
 }
 
 //+------------------------------------------------------------------+
-//| Open order – FIXED for error 4756                               |
-//+------------------------------------------------------------------+
-# KEEP YOUR ORIGINAL FILE EXACTLY THE SAME
-# ONLY REPLACE THE EXISTING OpenOrder() FUNCTION
-# WITH THIS FIXED VERSION BELOW
-
-//+------------------------------------------------------------------+
-//| Open order – FIXED for error 4756                               |
+//| Open order – FULLY FIXED (no 4756, no duplicate)               |
 //+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
@@ -263,87 +256,53 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
    if(lot <= 0) return;
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-
-   double ask   = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid   = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    double price = (type == ORDER_TYPE_BUY) ? ask : bid;
-
    price = NormalizeDouble(price, digits);
 
-   // ============================================================
-   // FIX INVALID STOPS (4756)
-   // ============================================================
-
+   // ---------- Broker stop & freeze levels ----------
    long stopsLevel  = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
    long freezeLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDistPoints = MathMax(stopsLevel, freezeLevel);
+   double minDist = minDistPoints * pointValue + 3 * pointValue;   // extra 3 points buffer
 
-   double brokerMin = MathMax(stopsLevel, freezeLevel) * pointValue;
-
-   // extra safety buffer
-   brokerMin += (5 * pointValue);
-
-   // strategy SL distance
+   // ---------- SL / TP calculation ----------
    double slDistance = (InpStopLossZScore - InpEntryZScore) * stddev;
+   if(slDistance < minDist) slDistance = minDist;
 
-   // ensure SL respects broker minimum
-   if(slDistance < brokerMin)
-      slDistance = brokerMin;
-
-   // TP
    double tpDistance = slDistance * 1.5;
 
-   double sl = 0;
-   double tp = 0;
-
+   double sl = 0, tp = 0;
    if(type == ORDER_TYPE_BUY)
    {
       sl = price - slDistance;
       tp = price + tpDistance;
-
-      if((price - sl) < brokerMin)
-         sl = price - brokerMin;
-
-      if((tp - price) < brokerMin)
-         tp = price + brokerMin;
+      if(price - sl < minDist) sl = price - minDist;
+      if(tp - price < minDist) tp = price + minDist;
    }
    else
    {
       sl = price + slDistance;
       tp = price - tpDistance;
-
-      if((sl - price) < brokerMin)
-         sl = price + brokerMin;
-
-      if((price - tp) < brokerMin)
-         tp = price - brokerMin;
+      if(sl - price < minDist) sl = price + minDist;
+      if(price - tp < minDist) tp = price - minDist;
    }
 
    sl = NormalizeDouble(sl, digits);
    tp = NormalizeDouble(tp, digits);
 
-   // ============================================================
-   // FILLING MODE
-   // ============================================================
-
+   // ---------- Filling mode ----------
    ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_RETURN;
-
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-
    if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
       filling = ORDER_FILLING_IOC;
    else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
       filling = ORDER_FILLING_FOK;
 
-   // ============================================================
-   // CREATE REQUEST
-   // ============================================================
-
-   MqlTradeRequest req;
-   MqlTradeResult  res;
-
-   ZeroMemory(req);
-   ZeroMemory(res);
-
+   // ---------- Build request ----------
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
    req.action       = TRADE_ACTION_DEAL;
    req.symbol       = symbol;
    req.magic        = InpMagicNumber;
@@ -354,64 +313,39 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
    req.tp           = tp;
    req.deviation    = InpSlippage;
    req.type_filling = filling;
-   req.comment      = (type == ORDER_TYPE_BUY)
-                      ? "MeanRev BUY"
-                      : "MeanRev SELL";
+   req.comment      = (type == ORDER_TYPE_BUY) ? "MeanRev BUY" : "MeanRev SELL";
 
-   // ============================================================
-   // ORDER CHECK BEFORE SEND
-   // ============================================================
-
+   // ---------- OrderCheck (prevents 4756) ----------
    MqlTradeCheckResult check;
    ZeroMemory(check);
-
    if(!OrderCheck(req, check))
    {
       Print("OrderCheck failed: ", GetLastError());
       return;
    }
-
    if(check.retcode != TRADE_RETCODE_DONE)
    {
-      Print("OrderCheck reject retcode=", check.retcode,
-            " | price=", price,
-            " | sl=", sl,
-            " | tp=", tp,
-            " | brokerMin=", brokerMin);
+      Print("OrderCheck reject | retcode=", check.retcode,
+            " | price=", price, " | sl=", sl, " | tp=", tp);
       return;
    }
 
-   // ============================================================
-   // SEND ORDER
-   // ============================================================
-
+   // ---------- Send order ----------
    if(OrderSend(req, res))
    {
-      if(res.retcode == TRADE_RETCODE_DONE ||
-         res.retcode == TRADE_RETCODE_PLACED)
-      {
-         Print((type == ORDER_TYPE_BUY)
-               ? "📈 BUY"
-               : "📉 SELL",
-               " Lot=", lot,
-               " Z=", DoubleToString(zScore,2),
-               " SL=", DoubleToString(sl,digits),
-               " TP=", DoubleToString(tp,digits));
-      }
+      if(res.retcode == TRADE_RETCODE_DONE || res.retcode == TRADE_RETCODE_PLACED)
+         Print((type==ORDER_TYPE_BUY)?"📈 BUY":"📉 SELL",
+               " Lot=", lot, " Z=", DoubleToString(zScore,2),
+               " SL=", DoubleToString(sl,digits), " TP=", DoubleToString(tp,digits));
       else
-      {
-         Print("Order rejected | retcode=",
-               res.retcode,
-               " | comment=",
-               res.comment);
-      }
+         Print("Order rejected | retcode=", res.retcode, " comment=", res.comment);
    }
    else
    {
-      Print("OrderSend failed | error=", GetLastError());
+      Print("OrderSend error: ", GetLastError());
    }
 }
-//+------------------------------------------------------------------+
+
 //+------------------------------------------------------------------+
 //| Calculate lot size (fixed ATR error)                            |
 //+------------------------------------------------------------------+
@@ -469,7 +403,7 @@ int CountPositions()
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop (unchanged)                                       |
+//| Trailing stop                                                   |
 //+------------------------------------------------------------------+
 void ManageTrailing()
 {
@@ -538,6 +472,9 @@ void ClosePosition(ulong ticket)
       Print("Close error: ", res.retcode);
 }
 
+//+------------------------------------------------------------------+
+//| Daily loss limit                                                |
+//+------------------------------------------------------------------+
 bool CheckDailyLoss()
 {
    double curBal = AccountInfoDouble(ACCOUNT_BALANCE);
@@ -560,6 +497,9 @@ bool CheckDailyLoss()
    return false;
 }
 
+//+------------------------------------------------------------------+
+//| Max drawdown emergency                                          |
+//+------------------------------------------------------------------+
 bool CheckDrawdown()
 {
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
