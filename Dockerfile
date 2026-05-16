@@ -23,95 +23,101 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
-//|                                        TickScalper_ProfitTarget  |
-//|                Closes instantly at $0.50 profit                  |
+//|                    XAUUSD Smart Scalper EA                       |
+//|          Safer momentum scalper for small cent accounts          |
 //+------------------------------------------------------------------+
-#property copyright "Scalper for $10 Cent Account"
-#property version   "6.10"
 #property strict
+#property version   "1.00"
 
-// --- Inputs ---
-input double   InpRiskPercent        = 2.0;
-input double   InpFixedLot           = 0.01;
-input bool     InpUseAutoLot         = true;
+// ================= INPUTS =================
+input double RiskPercent            = 1.0;
+input double FixedLot               = 0.01;
+input bool   UseAutoLot             = true;
 
-input int      InpFastMA             = 10;
-input int      InpSlowMA             = 30;
-input int      InpRSIPeriod          = 7;
-input int      InpRSIOverbought      = 65;
-input int      InpRSIOversold        = 35;
+input double ProfitTargetUSD        = 0.50;
 
-input double   TargetProfitUSD       = 0.50;
+input int    FastEMA                = 20;
+input int    SlowEMA                = 50;
+input int    RSI_Period             = 14;
+input int    ATR_Period             = 14;
 
-// GOLD STOP LOSS
-input double   InpStopLossPoints     = 3000;
+input double ATR_SL_Multiplier      = 1.2;
+input double ATR_TP_Multiplier      = 0.8;
 
-input bool     InpUseTrailing        = false;
-input int      InpTrailingStart      = 5;
-input int      InpTrailingStep       = 3;
+input int    MaxSpreadPoints        = 300;
+input int    MaxConsecutiveLosses   = 3;
 
-input int      InpMagicNumber        = 20251001;
-input int      InpSlippage           = 20;
-input bool     InpPrintLog           = true;
+input int    MagicNumber            = 777001;
+input int    Slippage               = 20;
 
-// --- Globals ---
-int            fastMAHandle, slowMAHandle, rsiHandle;
-double         fastMA[], slowMA[], rsi[];
-int            expertMagic;
-string         symbol;
-double         pointValue, pipValue;
+input bool   PrintLogs              = true;
+
+// Trading Session UTC
+input int    SessionStartHour       = 13;
+input int    SessionEndHour         = 18;
+
+// ================= GLOBALS =================
+string symbol;
+
+int fastEMAHandle;
+int slowEMAHandle;
+int rsiHandle;
+int atrHandle;
+
+double fastEMA[];
+double slowEMA[];
+double rsiBuffer[];
+double atrBuffer[];
+
+int consecutiveLosses = 0;
+
+double pointValue;
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                           |
+//| Expert Init                                                     |
 //+------------------------------------------------------------------+
 int OnInit()
 {
    symbol = Symbol();
-   expertMagic = InpMagicNumber;
 
    pointValue = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   pipValue = pointValue * 10;
 
-   fastMAHandle = iMA(symbol, PERIOD_M1, InpFastMA, 0, MODE_EMA, PRICE_CLOSE);
-   slowMAHandle = iMA(symbol, PERIOD_M1, InpSlowMA, 0, MODE_EMA, PRICE_CLOSE);
-   rsiHandle    = iRSI(symbol, PERIOD_M1, InpRSIPeriod, PRICE_CLOSE);
+   fastEMAHandle = iMA(symbol, PERIOD_M1, FastEMA, 0, MODE_EMA, PRICE_CLOSE);
+   slowEMAHandle = iMA(symbol, PERIOD_M1, SlowEMA, 0, MODE_EMA, PRICE_CLOSE);
+   rsiHandle     = iRSI(symbol, PERIOD_M1, RSI_Period, PRICE_CLOSE);
+   atrHandle     = iATR(symbol, PERIOD_M1, ATR_Period);
 
-   if(fastMAHandle == INVALID_HANDLE ||
-      slowMAHandle == INVALID_HANDLE ||
-      rsiHandle == INVALID_HANDLE)
+   if(fastEMAHandle == INVALID_HANDLE ||
+      slowEMAHandle == INVALID_HANDLE ||
+      rsiHandle == INVALID_HANDLE ||
+      atrHandle == INVALID_HANDLE)
    {
       return INIT_FAILED;
    }
 
-   ArraySetAsSeries(fastMA, true);
-   ArraySetAsSeries(slowMA, true);
-   ArraySetAsSeries(rsi, true);
+   ArraySetAsSeries(fastEMA, true);
+   ArraySetAsSeries(slowEMA, true);
+   ArraySetAsSeries(rsiBuffer, true);
+   ArraySetAsSeries(atrBuffer, true);
 
-   Print("Tick Scalper started on ", symbol,
-         " | Profit Target: $", TargetProfitUSD);
+   Print("XAUUSD Smart Scalper Started");
 
    return INIT_SUCCEEDED;
 }
 
 //+------------------------------------------------------------------+
-//| Expert deinitialization                                         |
+//| Expert Deinit                                                   |
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   if(fastMAHandle != INVALID_HANDLE)
-      IndicatorRelease(fastMAHandle);
-
-   if(slowMAHandle != INVALID_HANDLE)
-      IndicatorRelease(slowMAHandle);
-
-   if(rsiHandle != INVALID_HANDLE)
-      IndicatorRelease(rsiHandle);
-
-   Print("EA removed.");
+   IndicatorRelease(fastEMAHandle);
+   IndicatorRelease(slowEMAHandle);
+   IndicatorRelease(rsiHandle);
+   IndicatorRelease(atrHandle);
 }
 
 //+------------------------------------------------------------------+
-//| Tick Function                                                   |
+//| OnTick                                                          |
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -121,255 +127,178 @@ void OnTick()
    if(!MQLInfoInteger(MQL_TRADE_ALLOWED))
       return;
 
-   // Close positions instantly at profit target
-   CheckAndCloseProfitablePositions();
+   if(!IsTradingSession())
+      return;
 
-   // Update indicators
+   if(GetSpreadPoints() > MaxSpreadPoints)
+      return;
+
+   if(consecutiveLosses >= MaxConsecutiveLosses)
+      return;
+
+   CheckCloseByProfit();
+
+   if(CountPositions() > 0)
+      return;
+
    if(!UpdateIndicators())
       return;
 
-   double fast   = fastMA[0];
-   double slow   = slowMA[0];
-   double rsiVal = rsi[0];
+   double fast = fastEMA[0];
+   double slow = slowEMA[0];
+   double rsi  = rsiBuffer[0];
+   double atr  = atrBuffer[0];
 
-   bool uptrend   = fast > slow;
-   bool downtrend = fast < slow;
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
    bool buySignal  = false;
    bool sellSignal = false;
 
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-
-   // BUY logic
-   if(uptrend)
+   // BUY CONDITIONS
+   if(fast > slow)
    {
-      if(bid > fast || rsiVal < InpRSIOverbought)
-         buySignal = true;
-   }
-   else
-   {
-      if(bid > fast && rsiVal < InpRSIOverbought)
+      if(bid <= fast && rsi > 45 && rsi < 65)
          buySignal = true;
    }
 
-   // SELL logic
-   if(downtrend)
+   // SELL CONDITIONS
+   if(fast < slow)
    {
-      if(ask < fast || rsiVal > InpRSIOversold)
-         sellSignal = true;
-   }
-   else
-   {
-      if(ask < fast && rsiVal > InpRSIOversold)
+      if(ask >= fast && rsi < 55 && rsi > 35)
          sellSignal = true;
    }
 
-   // One trade at a time
-   if(CountOpenPositions() == 0)
-   {
-      if(buySignal)
-         OpenBuy();
+   if(buySignal)
+      OpenBuy(atr);
 
-      if(sellSignal)
-         OpenSell();
-   }
-
-   // Optional trailing
-   if(InpUseTrailing)
-      ManageTrailingStops();
+   if(sellSignal)
+      OpenSell(atr);
 }
 
 //+------------------------------------------------------------------+
 //| Open BUY                                                        |
 //+------------------------------------------------------------------+
-void OpenBuy()
+void OpenBuy(double atr)
 {
-   double lotSize = CalculateLotSize();
+   double lot = CalculateLotSize(atr);
 
-   if(lotSize <= 0)
-      return;
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
 
-   double entry = SymbolInfoDouble(symbol, SYMBOL_ASK);
-
-   // GOLD STOP LOSS
-   double sl = entry - (InpStopLossPoints * pointValue);
-
-   ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_IOC;
-
-   int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-
-   if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-      filling = ORDER_FILLING_IOC;
-   else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-      filling = ORDER_FILLING_FOK;
-   else
-      filling = ORDER_FILLING_RETURN;
+   double sl = ask - (atr * ATR_SL_Multiplier);
+   double tp = ask + (atr * ATR_TP_Multiplier);
 
    MqlTradeRequest req;
-   MqlTradeResult  res;
+   MqlTradeResult res;
 
    ZeroMemory(req);
    ZeroMemory(res);
 
    req.action       = TRADE_ACTION_DEAL;
    req.symbol       = symbol;
-   req.volume       = lotSize;
+   req.magic        = MagicNumber;
    req.type         = ORDER_TYPE_BUY;
-   req.price        = entry;
+   req.volume       = lot;
+   req.price        = ask;
    req.sl           = NormalizeDouble(sl, _Digits);
-   req.tp           = 0;
-   req.deviation    = InpSlippage;
-   req.magic        = expertMagic;
-   req.comment      = "TickScalper BUY";
-   req.type_filling = filling;
+   req.tp           = NormalizeDouble(tp, _Digits);
+   req.deviation    = Slippage;
+   req.type_filling = ORDER_FILLING_IOC;
+   req.comment      = "SmartScalper BUY";
 
    if(OrderSend(req, res))
    {
-      if(res.retcode == TRADE_RETCODE_DONE ||
-         res.retcode == TRADE_RETCODE_PLACED)
-      {
-         if(InpPrintLog)
-            Print("BUY OPENED | Lot: ", lotSize,
-                  " | Price: ", entry,
-                  " | SL: ", req.sl);
-      }
-      else
-      {
-         Print("BUY rejected | Retcode: ", res.retcode);
-      }
-   }
-   else
-   {
-      Print("BUY OrderSend failed: ", GetLastError());
+      if(PrintLogs)
+         Print("BUY OPENED | Lot:", lot);
    }
 }
 
 //+------------------------------------------------------------------+
 //| Open SELL                                                       |
 //+------------------------------------------------------------------+
-void OpenSell()
+void OpenSell(double atr)
 {
-   double lotSize = CalculateLotSize();
+   double lot = CalculateLotSize(atr);
 
-   if(lotSize <= 0)
-      return;
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
-   double entry = SymbolInfoDouble(symbol, SYMBOL_BID);
-
-   // GOLD STOP LOSS
-   double sl = entry + (InpStopLossPoints * pointValue);
-
-   ENUM_ORDER_TYPE_FILLING filling = ORDER_FILLING_IOC;
-
-   int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-
-   if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-      filling = ORDER_FILLING_IOC;
-   else if((fillMode & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-      filling = ORDER_FILLING_FOK;
-   else
-      filling = ORDER_FILLING_RETURN;
+   double sl = bid + (atr * ATR_SL_Multiplier);
+   double tp = bid - (atr * ATR_TP_Multiplier);
 
    MqlTradeRequest req;
-   MqlTradeResult  res;
+   MqlTradeResult res;
 
    ZeroMemory(req);
    ZeroMemory(res);
 
    req.action       = TRADE_ACTION_DEAL;
    req.symbol       = symbol;
-   req.volume       = lotSize;
+   req.magic        = MagicNumber;
    req.type         = ORDER_TYPE_SELL;
-   req.price        = entry;
+   req.volume       = lot;
+   req.price        = bid;
    req.sl           = NormalizeDouble(sl, _Digits);
-   req.tp           = 0;
-   req.deviation    = InpSlippage;
-   req.magic        = expertMagic;
-   req.comment      = "TickScalper SELL";
-   req.type_filling = filling;
+   req.tp           = NormalizeDouble(tp, _Digits);
+   req.deviation    = Slippage;
+   req.type_filling = ORDER_FILLING_IOC;
+   req.comment      = "SmartScalper SELL";
 
    if(OrderSend(req, res))
    {
-      if(res.retcode == TRADE_RETCODE_DONE ||
-         res.retcode == TRADE_RETCODE_PLACED)
-      {
-         if(InpPrintLog)
-            Print("SELL OPENED | Lot: ", lotSize,
-                  " | Price: ", entry,
-                  " | SL: ", req.sl);
-      }
-      else
-      {
-         Print("SELL rejected | Retcode: ", res.retcode);
-      }
-   }
-   else
-   {
-      Print("SELL OrderSend failed: ", GetLastError());
+      if(PrintLogs)
+         Print("SELL OPENED | Lot:", lot);
    }
 }
 
 //+------------------------------------------------------------------+
-//| Close profitable positions                                      |
+//| Profit Close                                                    |
 //+------------------------------------------------------------------+
-void CheckAndCloseProfitablePositions()
+void CheckCloseByProfit()
 {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   for(int i=PositionsTotal()-1; i>=0; i--)
    {
       ulong ticket = PositionGetTicket(i);
 
       if(!PositionSelectByTicket(ticket))
          continue;
 
-      if(PositionGetString(POSITION_SYMBOL) != symbol)
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != expertMagic)
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber)
          continue;
 
       double profit = PositionGetDouble(POSITION_PROFIT);
 
-      if(profit >= TargetProfitUSD)
+      if(profit >= ProfitTargetUSD)
       {
          ClosePosition(ticket);
-
-         if(InpPrintLog)
-         {
-            Print("PROFIT TARGET HIT | Ticket: ",
-                  ticket,
-                  " | Profit: $",
-                  DoubleToString(profit, 2));
-         }
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Close position                                                  |
+//| Close Position                                                  |
 //+------------------------------------------------------------------+
 void ClosePosition(ulong ticket)
 {
    if(!PositionSelectByTicket(ticket))
       return;
 
+   ENUM_POSITION_TYPE type =
+      (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
    MqlTradeRequest req;
-   MqlTradeResult  res;
+   MqlTradeResult res;
 
    ZeroMemory(req);
    ZeroMemory(res);
-
-   ENUM_POSITION_TYPE posType =
-      (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
 
    req.action    = TRADE_ACTION_DEAL;
    req.position  = ticket;
    req.symbol    = symbol;
    req.volume    = PositionGetDouble(POSITION_VOLUME);
-   req.deviation = InpSlippage;
-   req.magic     = expertMagic;
+   req.magic     = MagicNumber;
+   req.deviation = Slippage;
 
-   if(posType == POSITION_TYPE_BUY)
+   if(type == POSITION_TYPE_BUY)
    {
       req.type  = ORDER_TYPE_SELL;
       req.price = SymbolInfoDouble(symbol, SYMBOL_BID);
@@ -380,45 +309,35 @@ void ClosePosition(ulong ticket)
       req.price = SymbolInfoDouble(symbol, SYMBOL_ASK);
    }
 
-   if(!OrderSend(req, res))
-   {
-      Print("Close failed: ", res.retcode);
-   }
+   OrderSend(req, res);
 }
 
 //+------------------------------------------------------------------+
-//| Lot size                                                        |
+//| Calculate Lot                                                   |
 //+------------------------------------------------------------------+
-double CalculateLotSize()
+double CalculateLotSize(double atr)
 {
-   double lot = InpFixedLot;
+   if(!UseAutoLot)
+      return FixedLot;
 
-   if(InpUseAutoLot && InpRiskPercent > 0)
-   {
-      double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
-      double riskAmount = balance * InpRiskPercent / 100.0;
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
 
-      double stopPips   = 10.0;
-      double slDistance = stopPips * pipValue;
+   double riskMoney = balance * RiskPercent / 100.0;
 
-      double tickVal = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
-      double tickSiz = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
 
-      double slTicks = slDistance / tickSiz;
+   if(tickValue <= 0)
+      return FixedLot;
 
-      if(slTicks > 0 && tickVal > 0)
-      {
-         lot = riskAmount / (slTicks * tickVal);
+   double slValue = atr * ATR_SL_Multiplier;
 
-         double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
-
-         if(step > 0)
-            lot = MathFloor(lot / step) * step;
-      }
-   }
+   double lot = riskMoney / (slValue / pointValue * tickValue);
 
    double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double step   = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+
+   lot = MathFloor(lot / step) * step;
 
    if(lot < minLot)
       lot = minLot;
@@ -426,27 +345,25 @@ double CalculateLotSize()
    if(lot > maxLot)
       lot = maxLot;
 
-   lot = NormalizeDouble(lot, 2);
-
-   return lot;
+   return NormalizeDouble(lot, 2);
 }
 
 //+------------------------------------------------------------------+
-//| Count positions                                                 |
+//| Count Positions                                                 |
 //+------------------------------------------------------------------+
-int CountOpenPositions()
+int CountPositions()
 {
    int count = 0;
 
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   for(int i=PositionsTotal()-1; i>=0; i--)
    {
       ulong ticket = PositionGetTicket(i);
 
       if(!PositionSelectByTicket(ticket))
          continue;
 
-      if(PositionGetString(POSITION_SYMBOL) == symbol &&
-         PositionGetInteger(POSITION_MAGIC) == expertMagic)
+      if(PositionGetInteger(POSITION_MAGIC) == MagicNumber &&
+         PositionGetString(POSITION_SYMBOL) == symbol)
       {
          count++;
       }
@@ -456,94 +373,48 @@ int CountOpenPositions()
 }
 
 //+------------------------------------------------------------------+
-//| Trailing stop                                                   |
+//| Spread Filter                                                   |
 //+------------------------------------------------------------------+
-void ManageTrailingStops()
+int GetSpreadPoints()
 {
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = PositionGetTicket(i);
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
-      if(!PositionSelectByTicket(ticket))
-         continue;
-
-      if(PositionGetString(POSITION_SYMBOL) != symbol)
-         continue;
-
-      if(PositionGetInteger(POSITION_MAGIC) != expertMagic)
-         continue;
-
-      double open = PositionGetDouble(POSITION_PRICE_OPEN);
-      double sl   = PositionGetDouble(POSITION_SL);
-
-      int type = (int)PositionGetInteger(POSITION_TYPE);
-
-      if(type == POSITION_TYPE_BUY)
-      {
-         double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-
-         double profitPips = (bid - open) / pipValue;
-
-         if(profitPips >= InpTrailingStart)
-         {
-            double newSL = bid - InpTrailingStep * pipValue;
-
-            if(newSL > sl)
-               ModifyStopLoss(ticket, newSL);
-         }
-      }
-      else
-      {
-         double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-
-         double profitPips = (open - ask) / pipValue;
-
-         if(profitPips >= InpTrailingStart)
-         {
-            double newSL = ask + InpTrailingStep * pipValue;
-
-            if(sl == 0 || newSL < sl)
-               ModifyStopLoss(ticket, newSL);
-         }
-      }
-   }
+   return (int)((ask - bid) / pointValue);
 }
 
 //+------------------------------------------------------------------+
-//| Modify stop loss                                                |
+//| Session Filter                                                  |
 //+------------------------------------------------------------------+
-void ModifyStopLoss(ulong ticket, double newSL)
+bool IsTradingSession()
 {
-   MqlTradeRequest req;
-   MqlTradeResult  res;
+   MqlDateTime tm;
+   TimeToStruct(TimeGMT(), tm);
 
-   ZeroMemory(req);
-   ZeroMemory(res);
-
-   req.action   = TRADE_ACTION_SLTP;
-   req.position = ticket;
-   req.symbol   = symbol;
-   req.sl       = newSL;
-   req.tp       = PositionGetDouble(POSITION_TP);
-
-   if(!OrderSend(req, res))
+   if(tm.hour >= SessionStartHour &&
+      tm.hour < SessionEndHour)
    {
-      Print("Modify SL failed: ", res.retcode);
+      return true;
    }
+
+   return false;
 }
 
 //+------------------------------------------------------------------+
-//| Update indicators                                               |
+//| Update Indicators                                               |
 //+------------------------------------------------------------------+
 bool UpdateIndicators()
 {
-   if(CopyBuffer(fastMAHandle, 0, 0, 2, fastMA) < 2)
+   if(CopyBuffer(fastEMAHandle, 0, 0, 3, fastEMA) < 3)
       return false;
 
-   if(CopyBuffer(slowMAHandle, 0, 0, 2, slowMA) < 2)
+   if(CopyBuffer(slowEMAHandle, 0, 0, 3, slowEMA) < 3)
       return false;
 
-   if(CopyBuffer(rsiHandle, 0, 0, 2, rsi) < 2)
+   if(CopyBuffer(rsiHandle, 0, 0, 3, rsiBuffer) < 3)
+      return false;
+
+   if(CopyBuffer(atrHandle, 0, 0, 3, atrBuffer) < 3)
       return false;
 
    return true;
