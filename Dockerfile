@@ -19,7 +19,7 @@ RUN wget -q https://download.mql5.com/cdn/web/metaquotes.software.corp/mt5/mt5se
     -O /root/mt5setup.exe
 
 # ============================================================
-# AGGRESSIVE MICRO SCALPER EA – FIXED 4756
+# AGGRESSIVE MICRO SCALPER EA – FIXED 4756 (min SL distance)
 # ============================================================
 RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //+------------------------------------------------------------------+
@@ -27,7 +27,7 @@ RUN cat > /root/VALETAX_TICK_BOT_V16.mq5 << 'EOF'
 //|                              No waiting – trades within 1 minute |
 //+------------------------------------------------------------------+
 #property copyright "Statistical Edge"
-#property version   "3.00"
+#property version   "3.01"
 #property strict
 
 //==================== INPUTS ====================
@@ -248,7 +248,7 @@ void ExitWhenMeanReached(double currentZ)
 }
 
 //+------------------------------------------------------------------+
-//| Open order (unchanged)                                          |
+//| Open order – FIXED for error 4756                               |
 //+------------------------------------------------------------------+
 void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 {
@@ -257,7 +257,14 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
 
    double price = (type == ORDER_TYPE_BUY) ? SymbolInfoDouble(symbol, SYMBOL_ASK)
                                            : SymbolInfoDouble(symbol, SYMBOL_BID);
+   // Normalize entry price to digits
+   price = NormalizeDouble(price, (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS));
+
    double slDistance = (InpStopLossZScore - InpEntryZScore) * stddev;
+   // MINIMUM SL DISTANCE: 10 points (1 pip on 5-digit brokers)
+   double minSLPoints = 10.0 * pointValue;
+   if(slDistance < minSLPoints) slDistance = minSLPoints;
+
    double tpDistance = slDistance * 1.5;
 
    double sl, tp;
@@ -272,8 +279,11 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
       tp = price - tpDistance;
    }
 
+   // Enforce broker's minimum stop level
    long stopsLevel = SymbolInfoInteger(symbol, SYMBOL_TRADE_STOPS_LEVEL);
    double minDist = stopsLevel * pointValue;
+   if(minDist < minSLPoints) minDist = minSLPoints;
+
    if(type == ORDER_TYPE_BUY)
    {
       if(price - sl < minDist) sl = price - minDist;
@@ -285,6 +295,16 @@ void OpenOrder(ENUM_ORDER_TYPE type, double zScore, double mean, double stddev)
       if(price - tp < minDist) tp = price - minDist;
    }
 
+   // Normalize SL and TP
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   sl = NormalizeDouble(sl, digits);
+   tp = NormalizeDouble(tp, digits);
+
+   // Final safety: SL and TP must be different from entry price
+   if(sl == price) sl = (type == ORDER_TYPE_BUY) ? price - minDist : price + minDist;
+   if(tp == price) tp = (type == ORDER_TYPE_BUY) ? price + minDist : price - minDist;
+
+   // Auto-detect filling mode
    int fillMode = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
    ENUM_ORDER_TYPE_FILLING filling;
    if((fillMode & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
@@ -488,8 +508,9 @@ bool CheckDrawdown()
 }
 //+------------------------------------------------------------------+
 EOF
+
 # ============================================================
-# ENTRYPOINT SCRIPT
+# ENTRYPOINT SCRIPT (unchanged)
 # ============================================================
 RUN cat > /entrypoint.sh << 'EOF'
 #!/bin/bash
